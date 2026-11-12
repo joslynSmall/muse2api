@@ -2,7 +2,7 @@
 id: CHATPRUN
 domain: chat-api
 title: 旁聊数量清理（保留最近 50 个）
-status: implemented
+status: active
 keywords: [sidechat, session.delete, sessions.list, 清理, 删除, 保留50]
 entrypoints: [thread_prune.py, engine.py, app.py]
 upstream: []
@@ -31,10 +31,16 @@ last_verified: 2026-11-12
 
 ```mermaid
 sequenceDiagram
+    participant M as 管理员
     participant E as engine.chat_stream
     participant P as thread_prune
     participant G as 网页 Gateway
-    E->>E: 本轮是新建 thread，回复已完成
+    alt CHATPRUN-B06 存量一次性手动清理
+        M->>P: POST /admin/accounts/{aid}/threads/prune（默认 dry_run）
+        P->>G: 同一套过滤与保护规则，dry_run 只返回计划
+    else CHATPRUN-B05 只在新建 thread 时触发
+        E->>E: 本轮是新建 thread，回复已完成（续轮不清理）
+    end
     E->>P: prune(page, keep=50, protect=已绑定 thread ∪ 本轮 thread)
     P->>G: sessions.list
     alt CHATPRUN-B01 超出 50 个
@@ -58,12 +64,12 @@ sequenceDiagram
 
 | ID | 分支 | 状态 | 代码位置 | 测试 | 终态 / 下一步 | 不变量 | 确认方 |
 |---|---|---|---|---|---|---|---|
-| CHATPRUN-B01 | 超出 50 个时删除最旧的旁聊 | implemented | thread_prune.py:deletion_candidates / prune | tests/test_thread_prune.py::test_keeps_newest…, test_protected_kinds…, test_prune_deletes_beyond_limit | 账号旁聊 ≤ 50（不含保护项） | 主要聊天、置顶、归档、频道/只读、受保护 thread 永不删除；按 updated_at_ms 保留最新 50 | user |
-| CHATPRUN-B02 | 未超出不删除 | implemented | thread_prune.py:deletion_candidates | test_under_limit_deletes_nothing | 不变 | 不发删除请求 | user |
-| CHATPRUN-B03 | 列表或网关不可用时跳过 | implemented | thread_prune.py:prune；app.py:_prune_side_chats | test_list_failure_skips | 跳过 | 不影响本轮回复 | model:清理是附带动作，失败不应让对话失败 |
-| CHATPRUN-B04 | 删除失败、未确认或限流时停止 | implemented | thread_prune.py:prune | test_unconfirmed_delete_stops | 停止，下次新建时继续 | 未确认 deleted=true 不算删除；遇错不继续删 | model:无法确认结果时继续批量删除风险更高 |
-| CHATPRUN-B05 | 只在新建 thread 时触发 | implemented | app.py:safe_chat_stream worker（仅 thread_id 为空时调用）；单次最多删 5 个 | test_incremental_cap | 续轮不清理 | 续接已绑定 thread 时不调用清理 | user |
-| CHATPRUN-B06 | 存量一次性手动清理 | implemented | app.py:POST /admin/accounts/{aid}/threads/prune（默认 dry_run） | test_dry_run_deletes_nothing | 账号旁聊 ≤ 50 | 用同一套过滤与保护规则 | user |
+| CHATPRUN-B01 | 超出 50 个时删除最旧的旁聊 | done | thread_prune.py:68; thread_prune.py:89 | tests/test_thread_prune.py::test_prune_deletes_beyond_limit | 账号旁聊 ≤ 50（不含保护项） | 主要聊天、置顶、归档、频道/只读、受保护 thread 永不删除；按 updated_at_ms 保留最新 50 | user |
+| CHATPRUN-B02 | 未超出不删除 | done | thread_prune.py:68 | tests/test_thread_prune.py::test_under_limit_deletes_nothing | 不变 | 不发删除请求 | user |
+| CHATPRUN-B03 | 列表或网关不可用时跳过 | done | thread_prune.py:89; app.py:410 | tests/test_thread_prune.py::test_list_failure_skips | 跳过 | 不影响本轮回复 | model:清理是附带动作，失败不应让对话失败 |
+| CHATPRUN-B04 | 删除失败、未确认或限流时停止 | done | thread_prune.py:89 | tests/test_thread_prune.py::test_unconfirmed_delete_stops | 停止，下次新建时继续 | 未确认 deleted=true 不算删除；遇错不继续删 | model:无法确认结果时继续批量删除风险更高 |
+| CHATPRUN-B05 | 只在新建 thread 时触发 | done | app.py:410 | tests/test_thread_prune.py::test_incremental_cap | 续轮不清理 | 续接已绑定 thread 时不调用清理 | user |
+| CHATPRUN-B06 | 存量一次性手动清理 | done | app.py:2647 | tests/test_thread_prune.py::test_dry_run_deletes_nothing | 账号旁聊 ≤ 50 | 用同一套过滤与保护规则 | user |
 
 ## 关联流程（边界分支）
 

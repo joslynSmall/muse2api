@@ -7,7 +7,7 @@ keywords: [websocket, onEvent, text_append, message_done, markdown, 首字, DOM]
 entrypoints: [engine.py, muse_events.py]
 upstream: []
 downstream: [CHATMSG]
-related: [CHATSESS]
+related: [CHATSESS, CHATPRUN]
 external: []
 last_verified: 2026-11-12
 ---

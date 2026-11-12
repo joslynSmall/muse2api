@@ -119,6 +119,11 @@ class Config:
     tool_protocol: bool = field(
         default_factory=lambda: _env("MUSE2API_TOOL_PROTOCOL", "0").strip() != "0")
 
+    # 绑定会话的续轮复用上一轮页面（CHATSESS-B14），省去每轮 40–80 秒的页面加载。
+    # 页面空闲超过这么多秒就关闭；0 表示不复用（每轮都重新打开页面）。
+    chat_page_idle: int = field(
+        default_factory=lambda: max(0, int(_env("MUSE2API_CHAT_PAGE_IDLE", "600"))))
+
     # 后台静默自动升级：发现上游有新提交时强制覆盖代码（checkout -f + reset）并退出进程。
     # 默认关闭——它会抹掉本地提交和 fork 的改动、改写 git origin；需要时在管理页手动升级。
     auto_upgrade: bool = field(

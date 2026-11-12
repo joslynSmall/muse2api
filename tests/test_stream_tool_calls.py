@@ -70,7 +70,38 @@ with tempfile.TemporaryDirectory() as home:
         assert json.loads(calls[0]["arguments"]) == {"command": 'ls -l "/tmp/a b"'}, calls
         assert text == "先查现状，确认缺哪些字段再改。", repr(text)
 
+        # CHATMSG-B09：正文在上游生成过程中就发出，不等整段结束。
+        # 上游在吐出工具调用前等待客户端先收到正文；若正文被整段缓冲，等待会超时。
+        import threading
+        client_saw_prose = threading.Event()
+        waited = []
+
+        def slow_upstream(*a, **k):
+            yield "先查一下"
+            yield "现状。\n\n"
+            waited.append(client_saw_prose.wait(timeout=5))
+            yield "tool_call\n"
+            yield '{"name": "Bash", "arguments": {"command": "ls"}}'
+
+        req = app.ChatRequest(model="muse-spark", stream=True, tools=TOOLS,
+                              messages=[{"role": "user", "content": "hi"}])
+
+        async def consume():
+            resp = await app.chat_completions(req)
+            body = []
+            async for part in resp.body_iterator:
+                part = part if isinstance(part, str) else part.decode()
+                body.append(part)
+                if '"content"' in part and "先查一下" in part:
+                    client_saw_prose.set()
+            return "".join(body)
+
+        with patch.object(app, "safe_chat_stream", side_effect=slow_upstream):
+            body = asyncio.run(consume())
+        assert waited == [True], ("CHATMSG-B09 正文必须在上游结束前送达客户端", waited)
+        assert '"finish_reason": "tool_calls"' in body or '"finish_reason":"tool_calls"' in body
+
         plain = "不需要工具，直接回答：上下文是 128k。"
         text, calls, finish = stream(app, plain)
         assert (text, calls, finish) == (plain, [], "stop"), (text, calls, finish)
-print("PASS: streamed prose + tool call becomes tool_calls; plain answers stay text")
+print("PASS: CHATMSG-B09 streamed prose + tool call becomes tool_calls; prose streams before end")

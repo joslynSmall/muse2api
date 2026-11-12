@@ -7,7 +7,7 @@ keywords: [session, thread, X-Claude-Code-Session-Id, passHeaders, compact, 绑�
 entrypoints: [app.py, chat_sessions.py, engine.py]
 upstream: []
 downstream: []
-related: [CHATMSG, CHATSRC]
+related: [CHATMSG, CHATSRC, CHATPRUN]
 external: []
 last_verified: 2026-11-12
 ---
@@ -73,6 +73,14 @@ sequenceDiagram
         A-->>C: 错误事件，不返回空的成功回复
     else CHATSESS-B11 生成完成但绑定无法写入
         A-->>C: 错误，不发送成功结束事件
+    else CHATSESS-B13 续轮工具清单与上次相同
+        A->>E: 只附简短提醒（工具名 + 参数名），不重发完整清单
+    else CHATSESS-B14 续轮复用上一轮的热页面
+        A->>E: 同会话、同账号、同 thread、同代理快照的热页面
+        E->>W: 校验仍在 /thread/<uuid> 且输入框就绪后直接发送
+        Note over E,W: 校验失败或不匹配 → 关闭热页面，回到 B03 冷启动
+    else CHATSESS-B15 热页面回收
+        Note over A,E: 失败、取消、空闲超时、账号维护、别的会话借用该账号 → 关闭页面
     else CHATSESS-B12 客户端在首包或生成中断开
         C->>A: 关闭连接
         A->>E: 设置取消信号，浏览器线程停止
@@ -95,12 +103,15 @@ sequenceDiagram
 | CHATSESS-B10 | 绑定会话生成前失败如实报错 | done | app.py:506; app.py:514 | tests/test_safe_chat_stream_session.py::CHATSESS_B10_pinned_auth_error_is_raised | 错误事件 | 不返回空成功；不推进绑定 | user |
 | CHATSESS-B11 | 绑定写入失败不返回成功 | done | app.py:1061 | tests/test_chat_session_endpoints.py::CHATSESS-B11 | 错误事件 | 有 message_stop / [DONE] 必然已写入绑定 | user |
 | CHATSESS-B12 | 断开时取消浏览器线程后再释放占用 | done | app.py:555; app.py:559; app.py:1061; chat_transport.py:66; chat_transport.py:100; chat_sessions.py:97; chat_sessions.py:143 | tests/test_chat_cancel.py::CHATSESS_B12 | 会话占用释放 | 释放占用前浏览器线程已停止；首包后断开也释放；占用有 owner token，旧请求不能清掉新请求的占用、也不能写入绑定；调用方提前关闭时立即叫停浏览器线程 | user |
-| CHATSESS-B13 | 续轮工具清单不变只发简短提醒 | done | app.py:1087; tool_protocol.py:build_tools_reminder; chat_sessions.py:commit(tools_sig) | tests/test_chat_session_endpoints.py::CHATSESS-B13 | 续轮提示词从约 7 万字降到约 1 千字 | 只在 continue 且清单指纹等于该 thread 上次成功发送的指纹时用提醒；新建、重绑、清单变化时发完整清单；失败轮次不更新指纹 | model:同一 thread 前文已有完整定义，重复发送只增加噪声和延迟 |
+| CHATSESS-B13 | 续轮工具清单不变只发简短提醒 | done | app.py:1122; tool_protocol.py:247; chat_sessions.py:152 | tests/test_chat_session_endpoints.py::CHATSESS-B13 | 续轮提示词从约 7 万字降到约 1 千字 | 只在 continue 且清单指纹等于该 thread 上次成功发送的指纹时用提醒；新建、重绑、清单变化时发完整清单；失败轮次不更新指纹 | model:同一 thread 前文已有完整定义，重复发送只增加噪声和延迟 |
+| CHATSESS-B14 | 续轮复用上一轮的热页面 | done | app.py:430; engine.py:833; engine.py:866 | tests/test_chat_page_reuse.py::CHATSESS_B14 | 跳过 40–80 秒的页面加载（实测 65 s → 5 ms） | 只在 continue 且账号、thread、代理快照全部一致时复用；复用前校验 URL 仍为该 thread、输入框就绪；不满足即关闭并冷启动 | user |
+| CHATSESS-B15 | 热页面回收 | done | engine.py:893; app.py:3509; app.py:230 | tests/test_chat_page_reuse.py::CHATSESS_B15 | 页面与 BrowserContext 释放 | 失败 / 取消 / 绑定未写入的轮次不保留页面；空闲超时关闭；同账号被其他会话或维护操作使用前关闭；每个账号最多一个热页面 | model:与原每轮关页的隔离语义一致，只在明确匹配时延长生命周期 |
 | CHATSESS-B08 | 同会话并发拒绝 | done | chat_sessions.py:97; app.py:1013 | tests/test_chat_sessions.py::CHATSESS_B08 | 409 | 同一 key 同时只有一个请求；ttl=timeout+60 兜底 | model:并发写同一 thread 会让增量错位 |
 
 ## 关联流程（边界分支）
 
 - CHATMSG：Messages 的文本 / 工具输出不变，仅输入侧改为增量；CHATMSG-B08 由本流程取代。
+- CHATPRUN：清理在热页面上执行；保护集合包含本轮 thread，复用不影响清理规则。
 
 ## 待确认问题 / 待决策
 
@@ -110,6 +121,8 @@ sequenceDiagram
 
 | 日期 | 任务 | 变更的分支 ID |
 |---|---|---|
+| 2026-11-12 | 实现热页面复用与回收；真实 claude 三轮工具调用验证续轮首字 2–8 秒 | CHATSESS-B14、CHATSESS-B15 |
+| 2026-11-12 | 登记热页面复用与回收 | CHATSESS-B14、CHATSESS-B15 |
 | 2026-11-12 | 精简工具提示词：紧凑 Schema、续轮简短提醒 | CHATSESS-B13 |
 | 2026-11-12 | 对齐需求并登记会话绑定分支 | CHATSESS-B01..B08 |
 | 2026-11-12 | 复核：CHATSRC 改动 engine.py，B02 的 thread 回报移入 _report_thread，B05 行号变化，行为不变 | CHATSESS-B02、CHATSESS-B05 |

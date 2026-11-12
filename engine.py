@@ -309,6 +309,9 @@ class MuseEngine:
         self._download_dirs: set[str] = set()
         self.proxy_resolver = None
         self._last_http_renew: dict[str, float] = {}
+        # 续轮热页面（CHATSESS-B14/B15）：账号 -> 停放的页面状态；每个账号最多一个。
+        self._parked: dict[str, dict] = {}
+        self._parked_lock = threading.Lock()
         self._log = None
         os.makedirs(cfg.profile_dir, exist_ok=True)
 
@@ -404,6 +407,7 @@ class MuseEngine:
     def stop(self):
         with self._start_lock:
             self._close_page()
+            self.discard_parked()
             if self.browser:
                 with self._contexts_lock:
                     for ctx_id in list(self._active_contexts):
@@ -822,6 +826,102 @@ class MuseEngine:
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie")
         raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
+
+    _PARK_FIELDS = ("page", "current_context_id", "current_acc_id", "proxy_relay",
+                    "proxy_config", "download_dir")
+
+    def park_current_page(self, account_id: str, owner: str,
+                          thread_id: str | None = None) -> bool:
+        """把当前线程的页面整体移交给账号槽位，留给同一会话的下一轮（CHATSESS-B14）。
+
+        只在本轮成功时调用；页面必须停在一个 thread 上（给了 ``thread_id`` 时必须是它）。
+        同账号已有停放页面时先关闭旧的。不满足条件就直接关闭页面。
+        """
+        local = self._ensure_local()
+        page = self.page
+        if page is None or not account_id or not owner:
+            self._close_page()
+            return False
+        try:
+            path = page.js("location.pathname") or ""
+        except Exception:  # noqa: BLE001
+            path = ""
+        match = re.fullmatch(r"/thread/([0-9a-fA-F-]{36})/?", path)
+        if (not match or (thread_id and match.group(1) != thread_id)
+                or self.current_acc_id != account_id):
+            self._close_page()
+            return False
+        thread_id = match.group(1)
+        state = {f: getattr(local, f, None) for f in self._PARK_FIELDS}
+        state.update(thread_id=thread_id, owner=owner, parked_at=time.monotonic())
+        for f in self._PARK_FIELDS:
+            setattr(local, f, None)
+        with self._parked_lock:
+            old = self._parked.pop(account_id, None)
+            self._parked[account_id] = state
+        if old:
+            self._dispose_parked(old)
+        return True
+
+    def adopt_parked_page(self, account_id: str, thread_id: str, owner: str,
+                          max_idle: float) -> bool:
+        """把停放页面接到当前线程。账号、会话、thread 必须一致且未超时，否则关闭它。"""
+        with self._parked_lock:
+            state = self._parked.pop(account_id, None)
+        if not state:
+            return False
+        fresh = time.monotonic() - state["parked_at"] <= max_idle
+        if not (fresh and state["owner"] == owner and state["thread_id"] == thread_id):
+            self._dispose_parked(state)
+            return False
+        if self.page is not None:
+            self._close_page()
+        local = self._ensure_local()
+        for f in self._PARK_FIELDS:
+            setattr(local, f, state[f])
+        # 停放期间页面可能被网页自己导航或断线：仍在该 thread 且输入框可用才算接管成功。
+        try:
+            path = (self.page.js("location.pathname") or "").rstrip("/")
+            usable = path == "/thread/" + thread_id and self._wait_ws_ready(self.page, timeout=5.0)
+        except Exception:  # noqa: BLE001
+            usable = False
+        if not usable:
+            self._close_page()
+            return False
+        return True
+
+    def discard_parked(self, account_id: str | None = None, max_idle: float | None = None) -> int:
+        """关闭停放页面：指定账号的、超过 ``max_idle`` 的，或（都不给时）全部（CHATSESS-B15）。"""
+        now = time.monotonic()
+        with self._parked_lock:
+            keys = [k for k, v in self._parked.items()
+                    if (account_id is None or k == account_id)
+                    and (max_idle is None or now - v["parked_at"] > max_idle)]
+            states = [self._parked.pop(k) for k in keys]
+        for state in states:
+            self._dispose_parked(state)
+        return len(states)
+
+    def discard_parked_unless(self, account_id: str, owner: str | None) -> None:
+        """账号即将被使用：停放页面不属于 ``owner`` 时关闭它（CHATSESS-B15）。"""
+        with self._parked_lock:
+            state = self._parked.get(account_id)
+            if state is None or (owner and state["owner"] == owner):
+                return
+            del self._parked[account_id]
+        self._dispose_parked(state)
+
+    def _dispose_parked(self, state: dict) -> None:
+        """在调用线程上临时装入停放状态，复用 _close_page 的完整清理。"""
+        local = self._ensure_local()
+        saved = {f: getattr(local, f, None) for f in self._PARK_FIELDS}
+        try:
+            for f in self._PARK_FIELDS:
+                setattr(local, f, state.get(f))
+            self._close_page()
+        finally:
+            for f in self._PARK_FIELDS:
+                setattr(local, f, saved[f])
 
     def close_current_page(self):
         """显式释放当前线程所持有的页面和隔离上下文。"""

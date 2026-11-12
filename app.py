@@ -144,7 +144,18 @@ class AccountPoolManager:
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
                 timeout: float = 60.0, record_use: bool = True,
-                stop_event=None) -> dict:
+                stop_event=None, parked_owner: str | None = None) -> dict:
+        acc = self._acquire(account_id, preferred_id, rotate, force_rotate, timeout,
+                            record_use, stop_event)
+        # 账号交出去之前，关掉不属于本次使用者的续轮热页面（CHATSESS-B15）。
+        try:
+            engine.discard_parked_unless(acc["id"], parked_owner)
+        except Exception:  # noqa: BLE001
+            log.warning("关闭续轮热页面失败", exc_info=True)
+        return acc
+
+    def _acquire(self, account_id, preferred_id, rotate, force_rotate, timeout,
+                 record_use, stop_event) -> dict:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
@@ -226,6 +237,10 @@ def _account_operation(aid: str):
             raise HTTPException(409, "账号正在执行任务或检测，请稍后再试")
         ACCOUNT_POOL.busy_accounts.add(aid)
         account = copy.deepcopy(account)
+    try:
+        engine.discard_parked_unless(aid, None)  # 维护操作前关闭续轮热页面（CHATSESS-B15）
+    except Exception:  # noqa: BLE001
+        log.warning("关闭续轮热页面失败", exc_info=True)
     try:
         _bind_account_proxy(account)
         yield account
@@ -415,8 +430,14 @@ def _prune_side_chats(page, account_id: str | None) -> None:
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None, expect_tools: bool = False,
                      on_final_text=None, thread_id: str | None = None,
-                     on_thread=None, pin_account: bool = False):
-    """网页工作线程独占账号和并发槽；队列等待、取消和重试共享截止时间。"""
+                     on_thread=None, pin_account: bool = False,
+                     session_key: str | None = None):
+    """网页工作线程独占账号和并发槽；队列等待、取消和重试共享截止时间。
+
+    给了 ``session_key``（绑定会话）时，成功结束后把页面停放给该会话的下一轮，
+    续轮直接接管，省去页面加载（CHATSESS-B14）。
+    """
+    reuse_pages = bool(session_key and CFG.chat_page_idle > 0)
     import queue
     q = queue.Queue(maxsize=100)
     control = current_control()
@@ -455,12 +476,14 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 if stop_event.is_set():
                     return
                 yielded = False
+                succeeded = False
                 try:
                     timings["phase"] = "account_acquire"
                     stage = time.monotonic()
                     if pin_account and cur_id:
                         acc = ACCOUNT_POOL.acquire(account_id=cur_id, timeout=remaining(),
-                                                   stop_event=stop_event)
+                                                   stop_event=stop_event,
+                                                   parked_owner=session_key)
                         cur_id, leased_id = acc["id"], acc["id"]
                         cur_cookies, cur_exp = acc["cookies"], acc.get("cookies_exp")
                         _bind_account_proxy(acc)
@@ -497,6 +520,12 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     engine.start()
                     timings["browser_start_ms"] = round((time.monotonic() - stage) * 1000)
                     first_engine_yield = None
+                    if reuse_pages and cur_id:
+                        if thread_id:
+                            timings["page_reused"] = int(engine.adopt_parked_page(
+                                cur_id, thread_id, session_key, CFG.chat_page_idle))
+                        else:
+                            engine.discard_parked(cur_id)  # 新开 / 重绑 thread：旧页面无用
                     timings["phase"] = "engine_page_and_send"
                     for chunk in engine.chat_stream(
                         cur_cookies, prompt, cur_exp, max(1, int(remaining())),
@@ -519,6 +548,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if not thread_id and not stop_event.is_set():
                         timings["phase"] = "thread_prune"
                         _prune_side_chats(engine.page, cur_id)
+                    succeeded = not stop_event.is_set()
                     return
                 except MuseAuthError as exc:
                     timings["error_type"] = type(exc).__name__
@@ -539,7 +569,12 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         raise
                 finally:
                     # 所有页面操作都在拥有该线程本地 page 的工作线程完成。
-                    engine.close_current_page()
+                    # 成功的绑定会话轮次停放页面给下一轮；失败、取消、无状态请求一律关闭。
+                    if succeeded and reuse_pages and cur_id:
+                        timings["page_parked"] = int(engine.park_current_page(
+                            cur_id, session_key, thread_id))
+                    else:
+                        engine.close_current_page()
                     _clear_account_proxy()
                     if slot:
                         GEN_LOCK.release()
@@ -1079,7 +1114,7 @@ class ChatTurn:
         if not self.plan.bound:
             return {}
         return {"thread_id": self.plan.thread_id, "on_thread": self.thread.append,
-                "pin_account": True}
+                "pin_account": True, "session_key": self.key}
 
     def prompt(self, build) -> str:
         return build(self.plan.messages)
@@ -1129,6 +1164,42 @@ def _is_side_request(messages: list[ChatMessage]) -> bool:
         return False
     head = _content_text(last.content).lstrip()[:4000]
     return any(line.lstrip().startswith(_SIDE_REQUEST_MARKERS) for line in head.splitlines())
+
+
+def _stream_tool_reply(chunks, tools, out: dict):
+    """带工具的流式回复：正文增量立即产出，疑似 tool_call 的尾部暂扣到结束再解析。
+
+    产出正文片段；结束后在 ``out`` 写入 ``calls``。最终正文以网页的完整快照为准：
+    已发出的部分不重放，只补发它的后缀；DOM 重渲染改写了已发正文时不补发。
+    Chat Completions 与 Messages 共用（CHATMSG-B09）。
+    """
+    splitter = ToolStreamSplitter()
+    final_text: list[str] = []
+    streamed = ""
+    hold = ""  # 尾部空白暂扣：可能紧挨着工具标记，不应作为正文发出
+    for chunk in chunks(final_text.append):
+        prefix = splitter.feed(chunk)
+        if prefix:
+            buf = hold + prefix
+            ready = buf.rstrip()
+            hold = buf[len(ready):]
+            if ready:
+                streamed += ready
+                yield ready
+    source = final_text[-1] if final_text else streamed + splitter.pending
+    calls, rest = parse_tool_calls(source, tools)
+    text = rest if calls else source
+    sent = streamed.rstrip()
+    normalized = text.lstrip()
+    if sent and normalized.startswith(sent):
+        remainder = normalized[len(sent):]
+    elif not sent:
+        remainder = text
+    else:
+        remainder = ""
+    if remainder:
+        yield remainder
+    out["calls"] = calls
 
 
 def _generate_tool_reply(cookies, prompt, expires, timeout, account_id,
@@ -1827,20 +1898,21 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
                     turn.commit()
                     yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 else:
-                    # 带工具时先收完整段再解析。模型若抢先在云端沙箱执行，会再要求一次工具调用。
-                    rest, calls = _generate_tool_reply(
-                        cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
-                        **extra)
+                    # 带工具时正文边生成边发；疑似工具调用的尾部暂扣，结束后解析（CHATMSG-B09）。
+                    result: dict = {}
+                    chunks = lambda on_final: safe_chat_stream(  # noqa: E731
+                        cookies, prompt, expires, timeout, account_id=acc_id,
+                        expect_tools=True, on_final_text=on_final, **extra)
+                    for text in _stream_tool_reply(chunks, req.tools, result):
+                        for piece in _pace_text(text):
+                            yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                    calls = result.get("calls")
                     turn.commit()
                     if calls:
-                        if rest:
-                            yield _sse(_chat_chunk(cid, created, model, {"content": rest}))
                         for piece in tool_call_deltas(calls):
                             yield _sse(_chat_chunk(cid, created, model, {"tool_calls": piece}))
                         yield _sse(_chat_chunk(cid, created, model, {}, finish="tool_calls"))
                     else:
-                        for piece in _pace_text(rest):
-                            yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
                         yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 if _want_usage(req.stream_options):
                     yield _sse({"id": cid, "object": "chat.completion.chunk",
@@ -2282,41 +2354,19 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
                     "type": "message_start", "message": opening})
                 calls = None
                 if has_tools:
-                    splitter = ToolStreamSplitter()
-                    final_text: list[str] = []
-                    streamed_prefix = ""
+                    result: dict = {}
+                    chunks = lambda on_final: safe_chat_stream(  # noqa: E731
+                        cookies, prompt, expires, timeout, account_id=acc_id,
+                        expect_tools=True, on_final_text=on_final, **extra)
                     text_started = False
-                    for chunk in safe_chat_stream(
-                            cookies, prompt, expires, timeout, account_id=acc_id,
-                            expect_tools=True, on_final_text=final_text.append, **extra):
-                        prefix = splitter.feed(chunk)
-                        if prefix:
-                            if not text_started:
-                                yield _sse_event("content_block_start", {
-                                    "type": "content_block_start", "index": 0,
-                                    "content_block": {"type": "text", "text": ""}})
-                                text_started = True
-                            streamed_prefix += prefix
-                            yield from _message_text_deltas(0, prefix)
-                    source = final_text[-1] if final_text else streamed_prefix + splitter.pending
-                    calls, rest = parse_tool_calls(source, req.tools)
-                    text = rest if calls else source
-                    sent = streamed_prefix.rstrip()
-                    normalized = text.lstrip()
-                    if sent and normalized.startswith(sent):
-                        remainder = normalized[len(sent):]
-                    elif not sent:
-                        remainder = text
-                    else:
-                        # DOM markdown 重渲染改写了已发正文；不重放。
-                        remainder = ""
-                    if remainder:
+                    for text in _stream_tool_reply(chunks, req.tools, result):
                         if not text_started:
                             yield _sse_event("content_block_start", {
                                 "type": "content_block_start", "index": 0,
                                 "content_block": {"type": "text", "text": ""}})
                             text_started = True
-                        yield from _message_text_deltas(0, remainder)
+                        yield from _message_text_deltas(0, text)
+                    calls = result.get("calls")
                     if text_started:
                         yield _sse_event("content_block_stop", {
                             "type": "content_block_stop", "index": 0})
@@ -3453,6 +3503,29 @@ async def _startup():
         _persist_env("MUSE2API_KEY", new_key)
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     asyncio.create_task(_keepalive_loop())
+    asyncio.create_task(_parked_page_reaper())
+
+
+async def _parked_page_reaper():
+    """定期关闭空闲超时的续轮热页面（CHATSESS-B15）；关闭前占用账号，避免和正在接管的请求竞争。"""
+    while True:
+        await asyncio.sleep(60)
+        idle = CFG.chat_page_idle
+        try:
+            for aid in list(engine._parked):
+                with ACCOUNT_POOL.cond:
+                    if aid in ACCOUNT_POOL.busy_accounts:
+                        continue
+                    ACCOUNT_POOL.busy_accounts.add(aid)
+                try:
+                    closed = await asyncio.to_thread(
+                        engine.discard_parked, aid, idle if idle > 0 else None)
+                    if closed:
+                        log.info("chat_page reaped account=%s", aid)
+                finally:
+                    ACCOUNT_POOL.release(aid)
+        except Exception:  # noqa: BLE001
+            log.warning("续轮热页面回收失败", exc_info=True)
 
 
 @app.on_event("shutdown")

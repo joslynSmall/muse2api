@@ -42,7 +42,11 @@ sequenceDiagram
         W->>E: DOM 快照
         E->>A: 代码块保留原样，不输出隐藏节点或危险 scheme
     end
-    alt CHATMSG-B04 工具调用
+    alt CHATMSG-B09 Chat Completions 带工具的流式回复
+        E->>A: 增量文本
+        A->>C: 正文 content 增量立即发出；疑似 tool_call 的尾部暂扣
+        A->>C: 结束后补发正文余量与 tool_calls，finish=tool_calls 或 stop
+    else CHATMSG-B04 工具调用
         E->>A: 工具标记及 JSON
         A->>C: tool_use 参数，不经过正文节流
         A->>C: stop_reason=tool_use，message_stop
@@ -67,17 +71,18 @@ sequenceDiagram
 | CHATMSG-B01 | 普通和带工具声明的大块正文分片 | done | app.py:2045; app.py:2111-2165 | tests/test_protocol_tool_calls.py::这是Muse一次性返回的大段正文 | end_turn / message_stop | 拼接等于正文；单个 DOM 大块最多约 2 秒节流；工具参数不进正文 | model:用户要求逐步显示；API text_delta 是展示分片，不等于 Muse 原生 token |
 | CHATMSG-B02 | 正文超链接目标保留（含 Muse 跳转包装解包） | done | engine.py:1471-1512 | tests/test_chat_links_browser.py::PASS: visible links retain HTTP(S) targets | 真实目标 URL 到达正文 text；非 HTTP(S) URL 只保留可见文字 | l.meta.ai 仅接受合法 HTTP(S) 的 u 参数目标；同一 DOM 提取器用于轮询和最终快照 | model:浏览器 anchor href 是 l.meta.ai/?u= 包装，目标地址在 u 参数
 | CHATMSG-B03 | 危险链接、代码、隐藏内容 | done | engine.py:1471-1512 | tests/test_chat_links_browser.py::PASS: visible links retain HTTP(S) targets | 安全文本 | 只允许可见 HTTP(S) href；隐藏节点不导出；pre/code 保持字面文本 | model:URL 解析协议白名单与 DOM 可见性检查为代码事实 |
-| CHATMSG-B04 | 正式工具调用交付 | inferred | app.py; tool_protocol.py | tests/test_protocol_tool_calls.py::tool_start | tool_use / message_stop | 参数仅在 input_json_delta；block index 连续 | |
-| CHATMSG-B05 | 非流式完整回复 | inferred | app.py | tests/test_protocol_tool_calls.py::second | end_turn | 输出内容保持完整 | |
-| CHATMSG-B06 | 生成错误 | planned | app.py | 待补 | error / 关闭流 | 无 message_stop 成功终态；错误不当正文 | model:当前端点异常分支只发送 error |
-| CHATMSG-B07 | 取消 | inferred | chat_transport.py | tests/test_chat_transport.py::verify_heartbeat_and_cancel | cancelled | 停止向下游发送；通知生产者退出 | |
+| CHATMSG-B04 | 正式工具调用交付 | done | app.py:2305; tool_protocol.py:437 | tests/test_protocol_tool_calls.py::tool_start | tool_use / message_stop | 参数仅在 input_json_delta；block index 连续 | model:测试断言 tool_use 块在正文后、input_json_delta 携带参数、stop_reason=tool_use |
+| CHATMSG-B05 | 非流式完整回复 | done | app.py:2403 | tests/test_protocol_tool_calls.py::second | end_turn | 输出内容保持完整 | model:测试断言非流式 stop_reason=end_turn 且 content 等于完整正文 |
+| CHATMSG-B06 | 生成错误 | done | app.py:2393 | tests/test_chat_session_endpoints.py::event: error | error / 关闭流 | 无 message_stop 成功终态；错误不当正文 | model:测试断言出错时有 event: error 且无 message_stop |
+| CHATMSG-B07 | 取消 | done | chat_transport.py:26 | tests/test_chat_transport.py::verify_heartbeat_and_cancel | cancelled | 停止向下游发送；通知生产者退出 | model:测试断言关闭流后生产者的 cancelled 信号被置位 |
 | CHATMSG-B08 | 客户端会话后续请求新建 Muse thread | removed | | | 由 CHATSESS 取代 | 带会话 Header 时绑定同一 thread | user |
+| CHATMSG-B09 | Chat Completions 带工具时正文边生成边发 | done | app.py:1169; app.py:1839 | tests/test_stream_tool_calls.py::CHATMSG-B09 | finish=tool_calls 或 stop | 正文增量拼接 + 补发余量 = 解析后的正文；tool_call 标记及 JSON 不进 content；已发正文不重放 | user |
 
 ## 关联流程（边界分支）
 
 - DOM 提取被 Chat Completions、Responses、Messages 共用：Muse l.meta.ai 包装链接解包同样影响三者，需同批回归。
 - SSE 呈现修复只修改 Messages 文本分片，不调整其他协议或工具参数。
-- 每次 API 请求销毁 BrowserContext，下一轮新建 /thread/new；当前缺稳定客户端会话映射，跨请求复用属于待实现架构分支。
+- 页面生命周期由 CHATSESS-B14/B15 负责：同会话续轮复用热页面，其余情况每轮销毁 BrowserContext。
 - 本次未修改账号选择、Cookie、VM 续签、图片或视频流程；其正确性不由本图背书。
 
 ## 待确认问题 / 待决策
@@ -88,5 +93,8 @@ sequenceDiagram
 
 | 日期 | 任务 | 变更的分支 ID |
 |---|---|---|
+| 2026-11-12 | 核对代码与终态测试，确认 B04–B07 | CHATMSG-B04、CHATMSG-B05、CHATMSG-B06、CHATMSG-B07 |
+| 2026-11-12 | 实现 Chat Completions 工具流式输出，与 Messages 共用 _stream_tool_reply | CHATMSG-B09 |
+| 2026-11-12 | 登记 Chat Completions 工具流式输出 | CHATMSG-B09 |
 | 2026-11-12 | B08 由 CHATSESS 取代 | CHATMSG-B08 |
 | 2026-11-12 | 首次从源码建立消息输出边界；补记 Muse 跳转链接解包与每请求新 thread 行为 | CHATMSG-B01、CHATMSG-B02、CHATMSG-B03、CHATMSG-B04、CHATMSG-B05、CHATMSG-B06、CHATMSG-B07、CHATMSG-B08 |
