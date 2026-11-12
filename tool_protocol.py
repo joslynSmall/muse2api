@@ -20,7 +20,8 @@ import re
 import uuid
 
 __all__ = ["build_tools_prompt", "build_tools_reminder", "parse_tool_calls", "tool_choice_value",
-           "unknown_tool_names", "build_unknown_tool_correction"]
+           "unknown_tool_names", "build_unknown_tool_correction",
+           "tool_call_problems", "build_tool_call_correction", "claims_execution"]
 
 
 _TOOL_PROTOCOL_HEAD = """【客户端工具说明】
@@ -32,13 +33,14 @@ _TOOL_PROTOCOL_HEAD = """【客户端工具说明】
 - 每个代码块只放一个 JSON 对象；要多个工具就写多个代码块。
 - name 必须是下面清单里的名字；arguments 必须是合法 JSON 对象。你自带的工具（如 browser.*、muse.*、搜索、画图）客户端执行不了，不要调用。
 - 不要用 json 代码块表示调用，也不要编造执行结果、退出码或主机名——命令还没跑过。
+- 长脚本或多行内容不要塞进命令参数：先用 Write 写成文件，再用 Bash 执行；只用工具定义里有的参数名。
 - 不需要工具时，直接用自然语言回答。
 
 可用工具（参数为 JSON Schema）：
 """
 
 _TOOL_REMINDER_HEAD = """【客户端工具说明（沿用前文）】
-工具清单和参数与前文相同。用户电脑上的操作只能通过下面的客户端工具完成；需要时只输出 ```tool_call 代码块（块内一个 JSON：{"name": "工具名", "arguments": {参数}}），然后结束回复等待结果。你自带的工具（如 browser.*、muse.*）客户端执行不了，不要调用。不要编造执行结果；不需要工具时直接回答。
+工具清单和参数与前文相同。用户电脑上的操作只能通过下面的客户端工具完成；需要时只输出 ```tool_call 代码块（块内一个 JSON：{"name": "工具名", "arguments": {参数}}），然后结束回复等待结果。你自带的工具（如 browser.*、muse.*）客户端执行不了，不要调用。只用下面列出的参数名；长脚本先用 Write 写成文件再用 Bash 执行。不要编造执行结果；不需要工具时直接回答。
 """
 
 # 只有工具清单里有 ToolSearch 时才追加：客户端把 MCP 等工具设为延迟加载，
@@ -347,6 +349,56 @@ def _as_tool_calls(obj, names: set[str] | None = None):
     return out or None
 
 
+_REPAIR_STOP_RE = re.compile(r"```|</tool_call\s*>|(?<![A-Za-z0-9_])tool_call(?![A-Za-z0-9_])", re.I)
+
+
+def _decode_lenient(text: str, pos: int, decoder: json.JSONDecoder,
+                    eat_fence: bool = False):
+    """解码 pos 处的 JSON；只缺末尾 ``}`` / ``]`` 时补齐后再试（CHATMSG-B10）。
+
+    返回 ``(obj, 原文中的结束位置)``。补齐只针对"字符串已闭合、只差收尾括号"：
+    片段截到下一个工具标记或代码块边界为止，按栈补上缺的括号；字符串没闭合、
+    括号错配等其他错误不修，交给上层纠正。
+    """
+    try:
+        return decoder.raw_decode(text, pos)
+    except json.JSONDecodeError:
+        pass
+    stop = _REPAIR_STOP_RE.search(text, pos + 1)
+    end = stop.start() if stop else len(text)
+    piece = text[pos:end].rstrip()
+    stack, in_str, esc = [], False, False
+    for ch in piece:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                return None, None
+    if in_str or not stack:
+        return None, None
+    try:
+        obj = json.loads(piece + "".join(reversed(stack)))
+    except json.JSONDecodeError:
+        return None, None
+    end = pos + len(piece)
+    if eat_fence:
+        # 行内 tool_call 标记后跟着的代码块收尾 ``` 属于这次调用，一并吞掉，不留在正文里；
+        # 代码块路径自己匹配闭合标记，不吞。
+        tail = re.match(r"\s*```[ \t]*(?=\n|$)", text[end:])
+        end += tail.end() if tail else 0
+    return obj, end
+
+
 def _decode_at(text: str, pos: int, names: set[str],
                decoder: json.JSONDecoder):
     """从 pos 起跳过空白后必须紧跟 JSON；返回 (calls, JSON 结束位置)。"""
@@ -355,9 +407,8 @@ def _decode_at(text: str, pos: int, names: set[str],
         pos += 1
     if pos >= size or text[pos] not in "{[":
         return None, None
-    try:
-        obj, end = decoder.raw_decode(text, pos)
-    except json.JSONDecodeError:
+    obj, end = _decode_lenient(text, pos, decoder)
+    if end is None:
         return None, None
     found = _as_tool_calls(obj, names)
     return (found, end) if found else (None, None)
@@ -443,6 +494,119 @@ def unknown_tool_names(text: str, tools=None) -> list[str]:
                     and name.strip() not in found:
                 found.append(name.strip())
     return found
+
+
+_JSON_TYPES = {"string": str, "boolean": bool, "object": dict, "array": list}
+
+
+def _argument_problems(name: str, arguments: str, schema: dict) -> list[str]:
+    """按工具 schema 检查顶层参数：必填、未声明的键、基本类型（CHATMSG-B11）。
+
+    只检查顶层，嵌套结构交给客户端；schema 没有 properties 时不检查。
+    """
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict) or not props:
+        return []
+    try:
+        args = json.loads(arguments)
+    except (TypeError, ValueError):
+        return ["%s 的参数不是 JSON 对象" % name]
+    problems = []
+    for key in schema.get("required") or []:
+        if key not in args:
+            problems.append("%s 缺少必填参数 %s" % (name, key))
+    # 客户端会拒绝未声明的参数（如 Bash 的 stdin），这里统一当错误处理。
+    extra = [k for k in args if k not in props]
+    if extra:
+        problems.append("%s 没有参数 %s（可用参数：%s）"
+                        % (name, "、".join(extra), "、".join(props)))
+    for key, spec in props.items():
+        if key not in args or not isinstance(spec, dict):
+            continue
+        kind = spec.get("type")
+        value = args[key]
+        if kind in ("integer", "number"):
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        elif kind in _JSON_TYPES:
+            ok = isinstance(value, _JSON_TYPES[kind])
+        else:
+            ok = True
+        if not ok:
+            problems.append("%s 的参数 %s 应为 %s" % (name, key, kind))
+    return problems
+
+
+def tool_call_problems(text: str, calls: list[dict] | None, tools=None,
+                       has_tool_results: bool = False) -> list[str]:
+    """回复里工具调用的问题清单；空表示可以交给客户端（CHATMSG-B12/B13）。
+
+    覆盖：调用了清单外的工具、tool_call 标记后的 JSON 无法解析、参数不符合 schema；
+    本轮输入没有工具结果、回复却声称已执行（编造结果）。
+    """
+    schemas = {t["name"]: t["parameters"] for t in _normalize_tools(tools)}
+    problems = []
+    unknown = unknown_tool_names(text, tools)
+    if unknown:
+        problems.append("调用了客户端没有的工具：%s" % "、".join(unknown))
+    for call in calls or []:
+        fn = call["function"]
+        problems.extend(_argument_problems(fn["name"], fn["arguments"],
+                                           schemas.get(fn["name"]) or {}))
+    if not calls and not unknown and _has_marker_with_json(text):
+        problems.append("tool_call 后的 JSON 格式不完整或无法解析")
+    # 本轮带着工具结果时，模型据此总结"已修改…"是正当的，不算编造。
+    if not calls and not problems and not has_tool_results and claims_execution(text):
+        problems.append("回复声称已经执行或给出了执行结果，但没有发出任何工具调用；"
+                        "命令还没有在用户电脑上运行过")
+    return problems
+
+
+# 声称"已在用户电脑上做完"的说法（CHATMSG-B13）。只在本轮没有任何工具调用时检查；
+# 要求同时出现完成态动词和执行对象，降低把普通解释误判为编造的概率。
+_CLAIM_DONE_RE = re.compile(
+    r"(已|已经|刚刚|刚才)(经)?\s*(生成|执行|运行|创建|写入|写好|修改|改好|部署|重启|安装|删除|保存)"
+    r"|(执行|运行)(结果|后|完毕|成功)"
+    r"|(真实|实际)(内容|输出|结果)(是|为|如下)"
+    r"|\b(I|I've|I have)\s+(ran|run|executed|created|wrote|written|deployed|restarted)\b"
+    r"|\b(output|result) (is|was)\s*:", re.I)
+_CLAIM_OBJECT_RE = re.compile(
+    r"(文件|命令|脚本|输出|内容|目录|服务|进程|容器|配置|数据库|\.\w{1,5}\b|`[^`]+`"
+    r"|\b(file|command|script|output|service|directory)\b)", re.I)
+
+
+def claims_execution(text: str) -> bool:
+    """回复声称已在用户电脑上执行过某事（无工具调用时即为编造）。"""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_CLAIM_DONE_RE.search(text) and _CLAIM_OBJECT_RE.search(text))
+
+
+def _has_marker_with_json(text: str) -> bool:
+    """tool_call 标记后紧跟（或下一行是）``{`` / ``[``：意图明确是调用而非提及。"""
+    if not isinstance(text, str):
+        return False
+    for match in _INLINE_RE.finditer(text):
+        start = _json_start(text, match.end())
+        if start is None:
+            nl = text.find("\n", match.end())
+            start = _json_start(text, nl) if nl >= 0 else None
+        if start is not None:
+            return True
+    return False
+
+
+def build_tool_call_correction(problems: list[str], tools=None) -> str:
+    """工具调用有问题时，在同一 thread 追发的纠正提示（CHATMSG-B12）。"""
+    has_search = any(t["name"] == "ToolSearch" for t in _normalize_tools(tools))
+    lines = ["【客户端提示】你上一条回复里的工具调用无法执行，已作废：",
+             *("- " + p for p in problems),
+             "请重新输出正确的调用：```tool_call 代码块内放一个完整、合法的 JSON 对象 "
+             '{"name": "工具名", "arguments": {参数}}，只用清单里的工具和参数名，然后结束回复。',
+             "长脚本或多行内容不要塞进命令参数：先用 Write 写成文件，再用 Bash 执行。"]
+    if has_search:
+        lines.append('需要 mcp__ 开头的 MCP 工具时，先调用 ToolSearch，参数 '
+                     '{"query": "select:工具全名", "max_results": 5}。')
+    return "\n".join(lines)
 
 
 def build_unknown_tool_correction(names: list[str], tools=None) -> str:
@@ -572,9 +736,8 @@ def parse_tool_calls(text: str, tools=None) -> tuple[list[dict] | None, str]:
         start = _json_start(text, match.end())
         if start is None:
             continue
-        try:
-            obj, end = decoder.raw_decode(text, start)
-        except json.JSONDecodeError:
+        obj, end = _decode_lenient(text, start, decoder, eat_fence=True)
+        if end is None:
             continue
         found = _as_tool_calls(obj, names)
         if found:

@@ -372,5 +372,65 @@ def test_CHATSESS_B16_reminder_keeps_deferred_note_and_detects_unknown_tools():
     assert "browser.browse" in note and "ToolSearch" in note
 
 
+def test_CHATMSG_B10_repairs_only_missing_closers():
+    real = ('好，按方案改：\n\ntool_call\n{"name": "Bash", "arguments": {"command": "ls -l", '
+            '"description": "看"}\n```')
+    calls, rest = tp.parse_tool_calls(real, TOOLS)
+    assert names(calls) == ["Bash"] and arguments(calls[0])["command"] == "ls -l"
+    assert rest == "好，按方案改：", rest
+    fenced = '```tool_call\n{"name": "Bash", "arguments": {"command": "a } b ] c"}\n```'
+    calls, _ = tp.parse_tool_calls(fenced, TOOLS)
+    assert arguments(calls[0])["command"] == "a } b ] c", "字符串里的括号不计入"
+    # 不修：字符串没闭合、括号错配、修完不是合法调用
+    for bad in ('```tool_call\n{"name": "Bash", "arguments": {"command": "x}\n```',
+                '```tool_call\n{"name": "Bash", "arguments": ["x"}\n```',
+                '```tool_call\n{"name": "Nope", "arguments": {"a": 1}\n```'):
+        assert tp.parse_tool_calls(bad, TOOLS)[0] is None, bad
+    # 两个调用，第一个缺括号：修复不能吞掉第二个
+    two = ('```tool_call\n{"name": "Bash", "arguments": {"command": "a"}\n```\n\n'
+           '```tool_call\n{"name": "Read", "arguments": {"file_path": "/x"}}\n```')
+    assert names(tp.parse_tool_calls(two, TOOLS)[0]) == ["Bash", "Read"]
+
+
+def test_CHATMSG_B11_B12_problems():
+    calls, _ = tp.parse_tool_calls(
+        '```tool_call\n{"name": "Bash", "arguments": {"command": "x", "stdin": "y"}}\n```', TOOLS)
+    assert tp.tool_call_problems("", calls, TOOLS) == [
+        "Bash 没有参数 stdin（可用参数：command）"]
+    calls, _ = tp.parse_tool_calls(
+        '```tool_call\n{"name": "Read", "arguments": {}}\n```', TOOLS)
+    assert tp.tool_call_problems("", calls, TOOLS) == ["Read 缺少必填参数 file_path"]
+    calls, _ = tp.parse_tool_calls(
+        '```tool_call\n{"name": "Bash", "arguments": {"command": 5}}\n```', TOOLS)
+    assert tp.tool_call_problems("", calls, TOOLS) == ["Bash 的参数 command 应为 string"]
+    broken = '```tool_call\n{"name": "Bash", "arguments": {"command": "x}\n```'
+    assert tp.tool_call_problems(broken, None, TOOLS) == ["tool_call 后的 JSON 格式不完整或无法解析"]
+    assert tp.tool_call_problems("讲解 tool_call 协议的正文，没有 JSON", None, TOOLS) == []
+    ok, _ = tp.parse_tool_calls('```tool_call\n{"name": "Bash", "arguments": {"command": "x"}}\n```', TOOLS)
+    assert tp.tool_call_problems("", ok, TOOLS) == []
+    note = tp.build_tool_call_correction(["Bash 没有参数 stdin"], TOOLS)
+    assert "stdin" in note and "Write" in note
+    assert "Write" in tp.build_tools_prompt(TOOLS) and "Write" in tp.build_tools_reminder(TOOLS)
+
+
+def test_CHATMSG_B13_claims_execution_without_tool_call():
+    fake = '已生成并执行，cat fmt.txt 的真实内容是：\n\n"a\\\\b"\n1\n4'
+    assert tp.claims_execution(fake)
+    assert tp.tool_call_problems(fake, None, TOOLS) != []
+    # 有工具结果的本轮总结是正当的
+    assert tp.tool_call_problems("已修改 nginx.conf 并重载服务。", None, TOOLS,
+                                 has_tool_results=True) == []
+    # 普通回答、计划、建议都不算
+    for ok in ("按要求先把多行 Python 脚本写成文件，再执行。",
+               "上下文窗口是 128k。",
+               "你可以执行 `nginx -t` 检查配置，然后重启服务。",
+               "CSP 头由 security-headers.conf 加上。"):
+        assert not tp.claims_execution(ok), ok
+        assert tp.tool_call_problems(ok, None, TOOLS) == [], ok
+    # 本轮有工具调用时不检查（调用本身就是执行途径）
+    calls, _ = tp.parse_tool_calls('已执行如下：\n```tool_call\n{"name": "Bash", "arguments": {"command": "ls"}}\n```', TOOLS)
+    assert calls and tp.tool_call_problems("", calls, TOOLS) == []
+
+
 if __name__ == "__main__":
     main()

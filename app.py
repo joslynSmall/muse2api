@@ -1066,7 +1066,7 @@ def _with_tools(prompt: str, tools: list | None, tool_choice=None) -> str:
 
 
 from tool_protocol import (ToolStreamSplitter, build_tools_prompt, build_tools_reminder,
-                            build_unknown_tool_correction, unknown_tool_names,
+                            build_tool_call_correction, tool_call_problems,
                             parse_tool_calls, tool_choice_value, tools_signature,
                             tool_choice_value as _tool_choice_value)
 
@@ -1137,6 +1137,11 @@ class ChatTurn:
             self.tools_sig = sig if note else self.plan.tools_sent
         return prompt + "\n\n" + note if note else prompt
 
+    @property
+    def has_tool_results(self) -> bool:
+        """本轮发出的输入里是否带工具结果（用于判断"已执行"的说法是否有依据）。"""
+        return any((getattr(m, "role", "") or "").lower() == "tool" for m in self.plan.messages)
+
     def retry_factory(self, cookies, expires, timeout, account_id):
         """绑定会话的纠正重试：在本轮所用 thread 上追发纠正提示（CHATSESS-B16）。"""
         if not self.plan.bound:
@@ -1183,15 +1188,16 @@ def _is_side_request(messages: list[ChatMessage]) -> bool:
     return any(line.lstrip().startswith(_SIDE_REQUEST_MARKERS) for line in head.splitlines())
 
 
-def _stream_tool_reply(chunks, tools, out: dict, retry=None):
+def _stream_tool_reply(chunks, tools, out: dict, retry=None, has_tool_results: bool = False):
     """带工具的流式回复：正文增量立即产出，疑似 tool_call 的尾部暂扣到结束再解析。
 
     产出正文片段；结束后在 ``out`` 写入 ``calls``。最终正文以网页的完整快照为准：
     已发出的部分不重放，只补发它的后缀；DOM 重渲染改写了已发正文时不补发。
     Chat Completions 与 Messages 共用（CHATMSG-B09）。
 
-    模型只调用了客户端没有的工具（如网页自带的 browser.*）时，这些调用不当正文发出；
-    给了 ``retry(纠正提示)`` 就在同一 thread 追发一次纠正并接着输出（CHATSESS-B16）。
+    工具调用无法执行时（清单外工具、JSON 坏了、参数不符），这些调用不当正文发出；
+    给了 ``retry(纠正提示)`` 就在同一 thread 追发一次纠正并接着输出（CHATSESS-B16、CHATMSG-B12）；
+    无法重试时给出一句可见说明，不让客户端停在一段无法执行的文字上。
     """
     splitter = ToolStreamSplitter()
     final_text: list[str] = []
@@ -1208,15 +1214,20 @@ def _stream_tool_reply(chunks, tools, out: dict, retry=None):
                 yield ready
     source = final_text[-1] if final_text else streamed + splitter.pending
     calls, rest = parse_tool_calls(source, tools)
-    unknown = [] if calls else unknown_tool_names(source, tools)
-    if unknown:
-        log.info("tool_call unknown names=%s retry=%s", unknown, retry is not None)
-        again = retry(build_unknown_tool_correction(unknown, tools)) if retry else None
+    problems = tool_call_problems(source, calls, tools, has_tool_results)
+    if problems:
+        # 调用无法执行（清单外工具、JSON 坏了、参数不符）：不交给客户端（CHATMSG-B12）。
+        log.info("tool_call rejected problems=%s retry=%s", problems, retry is not None)
+        again = retry(build_tool_call_correction(problems, tools)) if retry else None
         if again is not None:
-            yield from _stream_tool_reply(again, tools, out)
+            if streamed:
+                # 已发出的正文收不回；说明它没有被执行，再接纠正后的回复。
+                yield "\n\n（上面的回复没有实际执行：%s。已让模型重新发出工具调用。）\n\n" % problems[0]
+            yield from _stream_tool_reply(again, tools, out, None, has_tool_results)
             return
-        # 无法重试：不把执行不了的调用当正文发给客户端。
         out["calls"] = None
+        yield ("\n\n" if streamed else "") + (
+            "（模型输出的工具调用无法执行，已丢弃：%s。请重试或换个说法。）" % "；".join(problems))
         return
     text = rest if calls else source
     sent = streamed.rstrip()
@@ -1234,16 +1245,17 @@ def _stream_tool_reply(chunks, tools, out: dict, retry=None):
 
 def _generate_tool_reply(cookies, prompt, expires, timeout, account_id,
                          tools, tool_choice=None, thread_id=None,
-                         on_thread=None, pin_account=False) -> tuple[str, list[dict] | None]:
-    """每轮只生成一次；用显式协议解析工具，避免整段重试放大延迟与重复调用。"""
-    final = []
-    raw = "".join(safe_chat_stream(
+                         on_thread=None, pin_account=False, retry=None,
+                         session_key=None,
+                         has_tool_results: bool = False) -> tuple[str, list[dict] | None]:
+    """非流式：与流式共用 _stream_tool_reply，同样的修复、校验与纠正规则（CHATMSG-B10–B12）。"""
+    out: dict = {}
+    chunks = lambda on_final: safe_chat_stream(  # noqa: E731
         cookies, prompt, expires, timeout, account_id=account_id,
-        expect_tools=True, on_final_text=final.append, thread_id=thread_id,
-        on_thread=on_thread, pin_account=pin_account))
-    source = final[-1] if final else raw
-    calls, rest = parse_tool_calls(source, tools)
-    return (rest if calls else source), calls
+        expect_tools=True, on_final_text=on_final, thread_id=thread_id,
+        on_thread=on_thread, pin_account=pin_account, session_key=session_key)
+    text = "".join(_stream_tool_reply(chunks, tools, out, retry, has_tool_results))
+    return text, out.get("calls")
 
 
 def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
@@ -1935,7 +1947,8 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
                         expect_tools=True, on_final_text=on_final, **extra)
                     for text in _stream_tool_reply(
                             chunks, req.tools, result,
-                            turn.retry_factory(cookies, expires, timeout, acc_id)):
+                            turn.retry_factory(cookies, expires, timeout, acc_id),
+                            turn.has_tool_results):
                         for piece in _pace_text(text):
                             yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
                     calls = result.get("calls")
@@ -1974,7 +1987,9 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
     def run():
         if tool_note:
             return _generate_tool_reply(
-                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice, **extra)
+                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
+                retry=turn.retry_factory(cookies, expires, timeout, acc_id),
+                has_tool_results=turn.has_tool_results, **extra)
         text = "".join(safe_chat_stream(cookies, prompt, expires, timeout,
                                         account_id=acc_id, **extra))
         return text, None
@@ -2115,7 +2130,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     文本照常以 output_text 流出。带 tools 时先收完整段回复再解析：
     模型按协议输出的 JSON 变成 function_call，而不是混在正文里。
     """
-    prompt = build_chat_prompt(_responses_messages(req))
+    response_messages = _responses_messages(req)
+    prompt = build_chat_prompt(response_messages)
+    has_tool_results = any((m.role or "").lower() == "tool" for m in response_messages)
     if not prompt:
         raise HTTPException(400, "input 为空")
     has_tools = bool(CFG.tool_protocol and build_tools_prompt(req.tools, req.tool_choice))
@@ -2150,7 +2167,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     yield from _emit_response_text_live()
                     return
                 text, calls = _generate_tool_reply(
-                    cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice)
+                    cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
+                    has_tool_results=has_tool_results)
                 if text:
                     yield from _emit_response_text(rid, mid, 0, text, paced=not calls)
                 if calls:
@@ -2204,7 +2222,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     def run_response():
         if has_tools:
             return _generate_tool_reply(
-                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice)
+                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
+                has_tool_results=has_tool_results)
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id)), None
 
@@ -2393,7 +2412,8 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
                     text_started = False
                     for text in _stream_tool_reply(
                             chunks, req.tools, result,
-                            turn.retry_factory(cookies, expires, timeout, acc_id)):
+                            turn.retry_factory(cookies, expires, timeout, acc_id),
+                            turn.has_tool_results):
                         if not text_started:
                             yield _sse_event("content_block_start", {
                                 "type": "content_block_start", "index": 0,
@@ -2437,7 +2457,9 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
     def run_message():
         if has_tools:
             return _generate_tool_reply(
-                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice, **extra)
+                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
+                retry=turn.retry_factory(cookies, expires, timeout, acc_id),
+                has_tool_results=turn.has_tool_results, **extra)
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id, **extra)), None
 

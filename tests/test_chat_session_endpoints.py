@@ -257,13 +257,65 @@ with tempfile.TemporaryDirectory() as home:
         replies[:] = [bogus, good]
         status, body = tool_chat("claude-session-unknown-tool")
         assert status == 200 and '"finish_reason": "tool_calls"' in body, body
-        assert '"name": "Bash"' in body and "browser.browse" not in body, body
+        assert '"name": "Bash"' in body, body
+        # 执行不了的调用不能作为调用或原始 JSON 到达客户端（说明文字里提到名字可以）。
+        assert '\\"name\\": \\"browser.browse' not in body and '"name": "browser.browse"' not in body
         assert len(seen) == 2 and seen[1]["thread"] == THREAD_A, seen
         assert "browser.browse" in seen[1]["prompt"] and "ToolSearch" in seen[1]["prompt"]
         # 无会话（无法在同一 thread 纠正）：不重试，也不把执行不了的调用当正文发出。
         seen.clear()
         replies[:] = [bogus]
         status, body = tool_chat("", stateless=True)
-        assert len(seen) == 1 and "browser.browse" not in body and '"finish_reason": "stop"' in body
+        assert len(seen) == 1 and '"finish_reason": "stop"' in body
+        assert '"tool_calls"' not in body and '{\\"name\\": \\"browser.browse' not in body, body
+        assert "已丢弃" in body, "无法纠正时给出可见说明（CHATMSG-B12）"
 
-    print("PASS: CHATSESS endpoints bind, continue, rebind, fail closed, isolate agents, B16 correction")
+        # CHATMSG-B10：只缺末尾括号的 JSON 自动补齐，不重试。
+        seen.clear()
+        replies[:] = ['好。\n\n```tool_call\n{"name": "Bash", "arguments": {"command": "ls"}\n```']
+        status, body = tool_chat("claude-session-repair")
+        assert len(seen) == 1 and '"finish_reason": "tool_calls"' in body, body
+        # CHATMSG-B11/B03：参数不在 schema（stdin）→ 同一 thread 纠正后拿到合法调用。
+        seen.clear()
+        replies[:] = ['```tool_call\n{"name": "Bash", "arguments": {"command": "python3 -", '
+                      '"stdin": "print(1)"}}\n```', good]
+        status, body = tool_chat("claude-session-badargs")
+        assert len(seen) == 2 and "stdin" in seen[1]["prompt"] and "Write" in seen[1]["prompt"]
+        assert '"finish_reason": "tool_calls"' in body and "stdin" not in body, body
+        # CHATMSG-B12：JSON 坏到无法修复 → 纠正。
+        seen.clear()
+        replies[:] = ['```tool_call\n{"name": "Bash", "arguments": {"command": "echo "x}\n```', good]
+        status, body = tool_chat("claude-session-broken")
+        assert len(seen) == 2 and "JSON" in seen[1]["prompt"], seen
+        assert '"finish_reason": "tool_calls"' in body
+        # 纠正后仍然错误：只纠正一次，给出可见说明，不进入循环。
+        seen.clear()
+        replies[:] = [bogus, bogus]
+        status, body = tool_chat("claude-session-twice")
+        assert len(seen) == 2 and "已丢弃" in body and '"finish_reason": "stop"' in body
+
+        # CHATMSG-B13：没调用工具却声称已执行 → 同一 thread 纠正，拿到真实调用。
+        seen.clear()
+        replies[:] = ['已生成并执行，cat fmt.txt 的真实内容是：1 4 9', good]
+        status, body = tool_chat("claude-session-fabricated")
+        assert len(seen) == 2 and "没有发出任何工具调用" in seen[1]["prompt"], seen
+        assert '"finish_reason": "tool_calls"' in body and '"name": "Bash"' in body, body
+        assert "没有实际执行" in body, "已流出的编造正文后要有可见说明"
+        # 带着工具结果的续轮，据此总结"已修改…"不算编造，不重试。
+        sid = "claude-session-summary"
+        replies[:] = [good]
+        tool_chat(sid)
+        seen.clear()
+        replies[:] = ["已修改 nginx.conf 并重载服务。"]
+        follow = {"model": "muse-spark", "stream": True, "tools": [bash, search], "messages": [
+            {"role": "user", "content": "open the site"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "Bash", "arguments": "{\"command\": \"ls\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}
+        status, body = asyncio.run(asgi(app.app, "/v1/chat/completions", follow,
+                                        {"X-Claude-Code-Session-Id": sid}))
+        assert len(seen) == 1 and "已修改 nginx.conf" in body and '"finish_reason": "stop"' in body, body
+
+    print("PASS: CHATSESS endpoints bind, continue, rebind, fail closed, isolate agents, "
+          "B16 correction, CHATMSG-B10..B13 repair/validate/correct/fabrication")

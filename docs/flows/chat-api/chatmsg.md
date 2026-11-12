@@ -46,6 +46,16 @@ sequenceDiagram
         E->>A: 增量文本
         A->>C: 正文 content 增量立即发出；疑似 tool_call 的尾部暂扣
         A->>C: 结束后补发正文余量与 tool_calls，finish=tool_calls 或 stop
+    else CHATMSG-B10 工具调用 JSON 只缺末尾括号
+        E->>A: 补齐 } / ] 后能解析为合法调用 → 按 B04 交付，不重试
+    else CHATMSG-B11 工具调用参数不符合工具定义
+        E->>A: 缺必填、未声明的参数（如 Bash 的 stdin）、类型不对 → 不交付
+    else CHATMSG-B12 工具调用无法执行（清单外工具 / JSON 坏了 / 参数不符）
+        A->>E: 绑定会话：同一 thread 追发一次纠正，再按本图处理新回复
+        A->>C: 无法纠正或纠正后仍错：一句可见说明，finish=stop，不进入循环
+    else CHATMSG-B13 没有工具调用却声称已执行
+        E->>A: 本轮输入无工具结果，回复说"已生成并执行…真实内容是…"
+        A->>E: 按 B12 纠正一次；已流出的正文后补一句"上面的回复没有实际执行"
     else CHATMSG-B04 工具调用
         E->>A: 工具标记及 JSON
         A->>C: tool_use 参数，不经过正文节流
@@ -76,6 +86,10 @@ sequenceDiagram
 | CHATMSG-B06 | 生成错误 | done | app.py:2393 | tests/test_chat_session_endpoints.py::event: error | error / 关闭流 | 无 message_stop 成功终态；错误不当正文 | model:测试断言出错时有 event: error 且无 message_stop |
 | CHATMSG-B07 | 取消 | done | chat_transport.py:26 | tests/test_chat_transport.py::verify_heartbeat_and_cancel | cancelled | 停止向下游发送；通知生产者退出 | model:测试断言关闭流后生产者的 cancelled 信号被置位 |
 | CHATMSG-B08 | 客户端会话后续请求新建 Muse thread | removed | | | 由 CHATSESS 取代 | 带会话 Header 时绑定同一 thread | user |
+| CHATMSG-B10 | 只缺末尾括号的工具调用 JSON 自动补齐 | done | tool_protocol.py:355 | tests/test_tool_protocol_parser.py::CHATMSG_B10 | tool_use / tool_calls | 只补字符串已闭合时缺的 } / ]；字符串未闭合、括号错配、补齐后不是白名单内的合法调用都不采用；不吞掉后面的其他调用 | model:真实失败回复只缺最外层 }，补齐后与模型意图一致 |
+| CHATMSG-B11 | 工具调用参数按工具定义校验 | done | tool_protocol.py:502 | tests/test_tool_protocol_parser.py::CHATMSG_B11_B12 | 不交付，转 B12 | 顶层检查必填、未声明参数、基本类型；无 properties 的工具不检查 | model:Claude Code 会拒绝未声明参数，真实回复带了 Bash 不存在的 stdin |
+| CHATMSG-B12 | 无法执行的工具调用：纠正一次或可见说明 | done | tool_protocol.py:539; app.py:1186; app.py:1238 | tests/test_chat_session_endpoints.py::CHATMSG-B12 | 合法 tool_calls，或正文 + 说明 + stop | 无法执行的调用不进 tool_calls、不原样进正文；纠正只在绑定会话同一 thread 内一次；流式与非流式同一规则 | model:原行为把坏调用原样当正文交给客户端，用户看到一段未执行的 tool_call |
+| CHATMSG-B13 | 无工具调用却声称已执行（编造结果） | done | tool_protocol.py:577; app.py:1141; app.py:1191 | tests/test_chat_session_endpoints.py::CHATMSG-B13 | 纠正后的 tool_calls，或正文 + 说明 | 只在本轮输入不含工具结果、且无任何工具调用时检查；需同时出现完成态说法与执行对象；带工具结果的总结不算 | model:真实回复"已生成并执行，cat fmt.txt 的真实内容是…"而文件不存在 |
 | CHATMSG-B09 | Chat Completions 带工具时正文边生成边发 | done | app.py:1169; app.py:1839 | tests/test_stream_tool_calls.py::CHATMSG-B09 | finish=tool_calls 或 stop | 正文增量拼接 + 补发余量 = 解析后的正文；tool_call 标记及 JSON 不进 content；已发正文不重放 | user |
 
 ## 关联流程（边界分支）
@@ -93,6 +107,8 @@ sequenceDiagram
 
 | 日期 | 任务 | 变更的分支 ID |
 |---|---|---|
+| 2026-11-12 | 检测无工具调用却声称已执行，按 B12 纠正 | CHATMSG-B13 |
+| 2026-11-12 | 工具调用 JSON 补齐、参数校验、无法执行时纠正一次或可见说明 | CHATMSG-B10、CHATMSG-B11、CHATMSG-B12 |
 | 2026-11-12 | 核对代码与终态测试，确认 B04–B07 | CHATMSG-B04、CHATMSG-B05、CHATMSG-B06、CHATMSG-B07 |
 | 2026-11-12 | 实现 Chat Completions 工具流式输出，与 Messages 共用 _stream_tool_reply | CHATMSG-B09 |
 | 2026-11-12 | 登记 Chat Completions 工具流式输出 | CHATMSG-B09 |
