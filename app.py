@@ -49,6 +49,9 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from pydantic import model_validator, BaseModel, Field, SecretStr, field_validator
 
 from config import CFG
+from chat_transport import current_control, run_cancellable, stream_with_heartbeat
+from chat_sessions import ChatSessionStore, SessionPlan
+import thread_prune
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
@@ -85,6 +88,7 @@ app.add_middleware(CORSMiddleware,
                    max_age=600)
 
 store = Store(CFG)
+CHAT_SESSIONS = ChatSessionStore(CFG.chat_sessions_file)
 engine = MuseEngine(CFG)
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
 
@@ -139,10 +143,13 @@ class AccountPoolManager:
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float = 60.0, record_use: bool = True) -> dict:
+                timeout: float = 60.0, record_use: bool = True,
+                stop_event=None) -> dict:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise MuseGenerationError("客户端已取消账号等待")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise MuseGenerationError("等待空闲账号超时，当前所有账号均处于繁忙中")
@@ -246,6 +253,15 @@ def _err_type(status: int) -> str:
 
 @app.exception_handler(HTTPException)
 async def _http_exc(request: Request, exc: HTTPException):
+    if request.url.path == "/v1/messages":
+        kind = "authentication_error" if exc.status_code == 401 else (
+            "rate_limit_error" if exc.status_code == 429 else
+            "api_error" if exc.status_code >= 500 else "invalid_request_error")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"type": "error", "error": {
+                "type": kind, "message": str(exc.detail)}},
+            headers=getattr(exc, "headers", None))
     if request.url.path.startswith("/v1/"):
         return JSONResponse(
             status_code=exc.status_code,
@@ -269,13 +285,17 @@ async def _validation_exc(request: Request, exc: RequestValidationError):
             "type": "invalid_request_error", "param": None, "code": 422}})
     return JSONResponse(status_code=422, content={"detail": errors})
 
+# 网页端没有可调用的原生 reasoning 控制；不要对外伪称支持 effort。
 MODELS = [
     {"id": "muse-spark", "object": "model", "owned_by": "muse",
-     "description": "Muse Spark —— 文本 / 代码对话（网页免费额度，支持流式）"},
+     "description": "Muse Spark —— 文本 / 代码对话（网页免费额度，支持流式）",
+     "context_window": 160000},
     {"id": "muse-image", "object": "model", "owned_by": "muse",
-     "description": "Muse Image —— 文生图 / 图像编辑（网页免费额度）"},
+     "description": "Muse Image —— 文生图 / 图像编辑（网页免费额度）",
+     "reasoning": False},
     {"id": "muse-video", "object": "model", "owned_by": "muse",
-     "description": "Muse Video —— 文生视频 / 图生视频（网页免费额度）"},
+     "description": "Muse Video —— 文生视频 / 图生视频（网页免费额度）",
+     "reasoning": False},
 ]
 
 # 下游（Codex / Cline / 各种客户端）习惯按 OpenAI、Anthropic 的名字传模型，
@@ -317,16 +337,22 @@ def resolve_model(name: str | None, default: str = "muse-image") -> str:
 
 
 # ------------------------- 鉴权 -------------------------
-def auth(authorization: str | None = Header(default=None)):
+def auth(authorization: str | None = Header(default=None),
+         x_api_key: str | None = Header(default=None)):
+    """OpenAI 用 Bearer，Anthropic Messages 用 x-api-key，两者都认。"""
     if not CFG.api_key:
         return True
-    if not authorization or not authorization.lower().startswith("bearer "):
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        parts = authorization.split(None, 1)
+        token = parts[1].strip() if len(parts) > 1 else ""
+    elif x_api_key:
+        token = x_api_key.strip()
+    if token == CFG.api_key:
+        return True
+    if not authorization and not x_api_key:
         raise HTTPException(401, "缺少 Authorization: Bearer <key>")
-    parts = authorization.split(None, 1)
-    token = parts[1].strip() if len(parts) > 1 else ""
-    if not token or token != CFG.api_key:
-        raise HTTPException(401, "API key 无效")
-    return True
+    raise HTTPException(401, "API key 无效")
 
 
 # ------------------------- 请求模型 -------------------------
@@ -366,107 +392,200 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
     return store.get_account(acc_id)
 
 
+def _prune_side_chats(page, account_id: str | None) -> None:
+    """新建 thread 回复完成后清理旁聊（CHATPRUN-B05）；任何失败只记日志（B03/B04）。"""
+    if page is None:
+        return
+    try:
+        path = page.js("location.pathname") or ""
+    except Exception:  # noqa: BLE001
+        path = ""
+    match = re.fullmatch(r"/thread/([0-9a-fA-F-]{36})/?", path)
+    if not match:
+        # 认不出本轮 thread 就无法保护它，宁可跳过本次清理。
+        log.info("thread_prune skipped account=%s reason=unknown-thread", account_id)
+        return
+    protect = CHAT_SESSIONS.bound_thread_ids() | {match.group(1)}
+    result = thread_prune.prune(page, protect)
+    if result["planned"] or result["error"]:
+        log.info("thread_prune account=%s planned=%s deleted=%s error=%s", account_id,
+                 result["planned"], result["deleted"], result["error"] or "-")
+
+
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
-    """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
-    无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
-    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
+                     timeout: int, account_id: str | None, expect_tools: bool = False,
+                     on_final_text=None, thread_id: str | None = None,
+                     on_thread=None, pin_account: bool = False):
+    """网页工作线程独占账号和并发槽；队列等待、取消和重试共享截止时间。"""
     import queue
     q = queue.Queue(maxsize=100)
-    stop_event = threading.Event()
+    control = current_control()
+    stop_event = control.cancelled if control else threading.Event()
+    request_started = time.monotonic()
+    trace_id = uuid.uuid4().hex[:10]
+    deadline = request_started + timeout
+    timings = {}
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise MuseGenerationError("对话请求总时限已到")
+        return left
+
+    def publish(kind, value):
+        while not stop_event.is_set():
+            try:
+                q.put((kind, value), timeout=0.1)
+                return True
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    return False
+        return False
 
     def worker():
         cur_id = account_id
-        cur_cookies = cookies
-        cur_exp = expires
-        last_exc = None
+        cur_cookies, cur_exp = cookies, expires
         leased_id = None
+        slot = False
         try:
-            for attempt in range(2):
+            # 工具请求的协议纠正在上层统一处理，不叠加账号层的完整生成重试。
+            attempt = -1
+            for attempt in range(1 if expect_tools or pin_account else 2):
+                timings["attempt"] = attempt
                 if stop_event.is_set():
                     return
-                if attempt > 0:
-                    if leased_id:
-                        ACCOUNT_POOL.release(leased_id)
-                        leased_id = None
-                    try:
-                        alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
-                    except Exception:
-                        break
-                    if not alt or alt["id"] == cur_id:
-                        if alt:
-                            leased_id = alt["id"]
-                        break
-                    cur_id = alt["id"]
-                    leased_id = cur_id
-                    cur_cookies = alt["cookies"]
-                    cur_exp = alt.get("cookies_exp")
-                    log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
-                elif cur_id:
-                    ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
-                    leased_id = cur_id
-
                 yielded = False
                 try:
-                    if cur_id:
-                        _bind_account_proxy(store.get_account(cur_id) or {})
-                        refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
+                    timings["phase"] = "account_acquire"
+                    stage = time.monotonic()
+                    if pin_account and cur_id:
+                        acc = ACCOUNT_POOL.acquire(account_id=cur_id, timeout=remaining(),
+                                                   stop_event=stop_event)
+                        cur_id, leased_id = acc["id"], acc["id"]
+                        cur_cookies, cur_exp = acc["cookies"], acc.get("cookies_exp")
+                        _bind_account_proxy(acc)
+                    elif cur_id:
+                        acc = ACCOUNT_POOL.acquire(
+                            preferred_id=cur_id, rotate=attempt > 0,
+                            force_rotate=attempt > 0, timeout=remaining(),
+                            record_use=False, stop_event=stop_event)
+                        if attempt and acc["id"] == cur_id:
+                            ACCOUNT_POOL.release(acc["id"])
+                            raise MuseGenerationError("没有其他空闲账号可重试")
+                        cur_id, leased_id = acc["id"], acc["id"]
+                        cur_cookies, cur_exp = acc["cookies"], acc.get("cookies_exp")
+                        _bind_account_proxy(acc)
+                        timings["account_wait_ms"] = round((time.monotonic() - stage) * 1000)
+                        stage = time.monotonic()
+                        timings["phase"] = "session_refresh"
+                        refreshed = _renew_and_persist(cur_id, wake_vm=True, force=attempt > 0)
                         if refreshed:
                             cur_cookies = refreshed["cookies"]
                             cur_exp = refreshed.get("cookies_exp")
-                    with GEN_LOCK:
-                        if stop_event.is_set():
+                        timings["session_ms"] = round((time.monotonic() - stage) * 1000)
+                    stage = time.monotonic()
+                    timings["phase"] = "slot_wait"
+                    while not stop_event.is_set():
+                        if GEN_LOCK.acquire(timeout=min(0.2, remaining())):
+                            slot = True
+                            break
+                    timings["slot_wait_ms"] = round((time.monotonic() - stage) * 1000)
+                    if stop_event.is_set():
+                        return
+                    stage = time.monotonic()
+                    timings["phase"] = "browser_start"
+                    engine.start()
+                    timings["browser_start_ms"] = round((time.monotonic() - stage) * 1000)
+                    first_engine_yield = None
+                    timings["phase"] = "engine_page_and_send"
+                    for chunk in engine.chat_stream(
+                        cur_cookies, prompt, cur_exp, max(1, int(remaining())),
+                        account_id=cur_id, stop_event=stop_event,
+                        expect_tools=expect_tools,
+                        on_final_text=on_final_text,
+                        on_timing=lambda name, ms: timings.__setitem__(name, ms),
+                        thread_id=thread_id, on_thread=on_thread
+                    ):
+                        if first_engine_yield is None:
+                            first_engine_yield = time.monotonic()
+                            timings["phase"] = "generation"
+                            timings["engine_first_delta_ms"] = round(
+                                (first_engine_yield - request_started) * 1000)
+                        yielded = True
+                        if not publish("data", chunk):
                             return
-                        engine.start()
-                        for chunk in engine.chat_stream(
-                            cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
-                        ):
-                            yielded = True
-                            q.put(("data", chunk))
-                            if stop_event.is_set():
-                                return
-                    if cur_id:
+                    if cur_id and not stop_event.is_set():
                         store.mark(cur_id, True, "")
-                        _sync_cookies(cur_id)
+                    if not thread_id and not stop_event.is_set():
+                        timings["phase"] = "thread_prune"
+                        _prune_side_chats(engine.page, cur_id)
                     return
                 except MuseAuthError as exc:
-                    last_exc = exc
+                    timings["error_type"] = type(exc).__name__
+                    timings["failed_phase"] = timings.get("phase")
+                    if attempt == 0 and not yielded and len(store.list_accounts()) <= 1:
+                        raise
                     if cur_id:
                         store.mark(cur_id, False, str(exc))
-                    engine.close_current_page()
-                    if yielded:
-                        break
+                    if yielded or expect_tools or pin_account or attempt:
+                        raise
                 except Exception as exc:
-                    last_exc = exc
-                    try:
-                        engine.reset_thread()
-                    except Exception:
-                        pass
-                    if yielded:
-                        break
-            if last_exc is not None:
-                q.put(("error", last_exc))
+                    timings["error_type"] = type(exc).__name__
+                    timings["failed_phase"] = timings.get("phase")
+                    if attempt == 0 and not yielded and len(store.list_accounts()) <= 1:
+                        raise
+                    # 绑定会话只有一次机会：不换号重试，错误必须如实交给调用方。
+                    if yielded or expect_tools or pin_account or attempt:
+                        raise
+                finally:
+                    # 所有页面操作都在拥有该线程本地 page 的工作线程完成。
+                    engine.close_current_page()
+                    _clear_account_proxy()
+                    if slot:
+                        GEN_LOCK.release()
+                        slot = False
+                    if leased_id:
+                        ACCOUNT_POOL.release(leased_id)
+                        leased_id = None
+        except Exception as exc:
+            publish("error", exc)
         finally:
-            if leased_id:
-                ACCOUNT_POOL.release(leased_id)
-            engine.close_current_page()
-            _clear_account_proxy()
-            q.put(("done", None))
+            timings["total_ms"] = round((time.monotonic() - request_started) * 1000)
+            timings["first_delta"] = "engine_first_delta_ms" in timings
+            log.info("chat_timing id=%s tools=%s attempt=%s outcome=%s stages=%s",
+                     trace_id, expect_tools, timings.get("attempt", -1),
+                     "cancelled" if stop_event.is_set() else "finished",
+                     json.dumps(timings, sort_keys=True))
+            publish("done", None)
 
-    threading.Thread(target=worker, daemon=True).start()
-
+    browser = threading.Thread(target=worker, daemon=True, name="chat-browser")
+    browser.start()
+    finished = False
     try:
-        while True:
-            kind, val = q.get()
+        while not stop_event.is_set():
+            try:
+                kind, value = q.get(timeout=min(0.2, remaining()))
+            except queue.Empty:
+                continue
             if kind == "data":
-                yield val
+                yield value
             elif kind == "error":
-                raise val
+                raise value
             else:
+                finished = True
                 break
+        if not finished:
+            # 取消时绝不能让调用方当作正常结束去提交会话绑定。
+            raise MuseGenerationError("客户端已取消对话请求")
     finally:
-        stop_event.set()
+        # 正常结束时 worker 已退出；异常或调用方提前关闭生成器时必须叫停它，否则下面的 join
+        # 会一直等到总时限。外层 SSE 的取消信号同一个，这里设置只会让本请求停止。
+        if control is None or not finished:
+            stop_event.set()
+        # 等浏览器线程真正停下再返回，调用方释放会话占用后才不会有旧线程继续写 thread。
+        browser.join(timeout=max(1.0, deadline - time.monotonic()) + 5.0)
+        if browser.is_alive():
+            log.warning("chat-browser 线程在取消后仍未退出")
 
 
 class ImageRequest(BaseModel):
@@ -531,6 +650,8 @@ class ChatRequest(BaseModel):
     tool_choice: object | None = None
     response_format: object | None = None
     stream_options: object | None = None
+    reasoning_effort: str | None = None
+    reasoning: object | None = None
 
 
 class ResponsesRequest(BaseModel):
@@ -542,7 +663,25 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: int | None = None
     timeout: int | None = None
     tools: list | None = None
+    tool_choice: object | None = None
+    reasoning: object | None = None
     store: bool | None = None
+
+
+class MessagesRequest(BaseModel):
+    """Anthropic Messages API。"""
+    model: str = "muse-spark"
+    messages: list = []
+    system: str | list | None = None
+    metadata: dict | None = None
+    tools: list | None = None
+    tool_choice: object | None = None
+    output_config: object | None = None
+    thinking: object | None = None
+    stream: bool = False
+    max_tokens: int | None = None
+    timeout: int | None = None
+    metadata: dict | None = None
 
 
 class AccountProxy(BaseModel):
@@ -765,6 +904,81 @@ def _content_text(content) -> str:
     return str(content)
 
 
+def _tool_call_text(calls: list | None) -> str:
+    """把历史工具调用和执行结果写回为明确的协议转录。"""
+    if not calls:
+        return ""
+    items = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not name:
+            continue
+        args = fn.get("arguments")
+        if args is None:
+            args = fn.get("input") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"raw": args}
+        items.append({"name": name, "arguments": args})
+    if not items:
+        return ""
+    return "\n".join("```tool_call\n%s\n```" % json.dumps(item, ensure_ascii=False)
+                     for item in items)
+
+
+def _tool_results_text(results: list[tuple[str, str, str]]) -> str:
+    return "\n\n".join(
+        "【工具结果：%s，call_id=%s】\n%s" % (name or "unknown", call_id or "unknown", body or "（无输出）")
+        for name, call_id, body in results)
+
+
+def _messages_prompt(messages: list[ChatMessage]) -> str:
+    """拼 transcript 时把每个 tool_result 紧跟对应的调用放置，结果作为最新事实。"""
+    system, turns = [], []
+    pending: dict[str, str] = {}
+    for message in messages:
+        role = (message.role or "").strip().lower()
+        text = _content_text(message.content).strip()
+        if role == "tool":
+            pending[message.tool_call_id or ""] = (
+                "【工具结果：%s，call_id=%s】\n%s" % (
+                    message.name or "unknown", message.tool_call_id or "unknown",
+                    text or "（无输出）"))
+            continue
+        if role == "assistant" and message.tool_calls:
+            for call in message.tool_calls:
+                call_id = call.get("id") if isinstance(call, dict) else None
+                fn = call.get("function") if isinstance(call, dict) else None
+                name = fn.get("name", "") if isinstance(fn, dict) else ""
+                result = pending.pop(call_id or "", None)
+                if result:
+                    text += "\n\n" + result
+                elif name:
+                    text += "\n\n【工具调用已发出：%s】" % name
+        if not text:
+            continue
+        if role in ("system", "developer"):
+            system.append(text)
+        else:
+            turns.append((role, text))
+    parts = []
+    if system:
+        parts.append("背景与任务设定：\n" + "\n\n".join(system))
+    for role, text in turns:
+        parts.append(("助手" if role == "assistant" else "用户") + "：\n" + text)
+    if pending:
+        parts.append("【已执行的工具结果】\n" + "\n\n".join(pending.values()))
+        parts.append("工具结果已经执行完成，以结果为准；不要复述旧进度或重复调用已完成的工具。")
+    return "\n\n".join(parts)
+
+
 def build_chat_prompt(messages: list[ChatMessage]) -> str:
     """把 messages 拼成发给 muse.ai 的一段提示词。
 
@@ -781,11 +995,10 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
             if text:
                 turns.append(("user", "【工具执行结果】\n" + text))
             continue
+        call_text = _tool_call_text(m.tool_calls) if role == "assistant" else ""
+        if call_text:
+            text = (text + "\n\n" + call_text).strip() if text else call_text
         if not text:
-            # 部分客户端的 assistant 消息只带 tool_calls、没有正文
-            if role == "assistant" and m.tool_calls:
-                turns.append(("assistant", "【请求调用工具】" + json.dumps(
-                    m.tool_calls, ensure_ascii=False)[:600]))
             continue
         if role in ("system", "developer"):
             system.append(text)
@@ -807,135 +1020,129 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
     return "\n\n".join(parts)
 
 
-# ------------------------- 工具调用（function calling）适配 -------------------------
-# muse.ai 的网页模型**不会**返回结构化的 tool_calls，所以这里做一层协议适配：
-#   1) 请求带 tools 时，把工具定义翻译成提示词里的【工具调用协议】；
-#   2) 模型按协议输出 ```json {"tool": "...", "arguments": {...}} ```；
-#   3) 我们把这段解析回 OpenAI 的 tool_calls 交给下游 agent。
-#
-# 注意：这是"尽力适配"而非保证 —— 目标模型是通用对话模型，没有针对
-# function calling 做微调，遵守协议的程度需要实测观察。
-_TOOL_PROTOCOL_HEAD = """你可以根据需要调用以下工具来协助用户完成任务。
-若需调用工具，请直接输出如下格式的 JSON 代码块（不要包含其他多余解释）：
-```json
-{"name": "<工具名>", "arguments": {<参数>}}
-```
-如果需要调用多个工具，请输出包含多个对象的 JSON 数组。
-如果无需调用工具，请直接用自然语言回答。
-
-可用工具列表：
-"""
+def _with_tools(prompt: str, tools: list | None, tool_choice=None) -> str:
+    """开关打开且请求带工具时，把工具协议接到提示词末尾。"""
+    if not CFG.tool_protocol:
+        return prompt
+    note = build_tools_prompt(tools, tool_choice)
+    # 放在末尾：开头是 agent 自己的 system 提示，夹在中间容易被忽略；
+    # 紧贴用户消息之前，模型对末尾指令的遵守度明显更高。
+    return prompt + "\n\n" + note if note else prompt
 
 
-def _describe_params(params) -> str:
-    """把 JSON Schema 的参数描述成易读的多行文本。"""
-    if not isinstance(params, dict):
-        return "      （无参数）"
-    props = params.get("properties") or {}
-    required = set(params.get("required") or [])
-    if not props:
-        return "      （无参数）"
-    lines = []
-    for name, spec in props.items():
-        spec = spec if isinstance(spec, dict) else {}
-        lines.append("      - %s (%s, %s)%s" % (
-            name, spec.get("type") or "any",
-            "必填" if name in required else "可选",
-            (" " + spec["description"]) if spec.get("description") else ""))
-    return "\n".join(lines)
+from tool_protocol import (ToolStreamSplitter, build_tools_prompt, build_tools_reminder,
+                            parse_tool_calls, tool_choice_value, tools_signature,
+                            tool_choice_value as _tool_choice_value)
 
 
-def build_tools_prompt(tools: list | None) -> str:
-    """把 tools 定义翻译成提示词片段（没有工具时返回空串）。
+class ChatTurn:
+    """一次对话请求的会话绑定上下文（流程 CHATSESS），两个端点共用。
 
-    同时兼容 Chat Completions 的 `{"type":"function","function":{...}}`
-    和 Responses API 的 `{"type":"function","name":...,"parameters":...}`。
+    无会话 Header 时退化为原来的无状态行为：完整历史、随机账号、/thread/new。
     """
-    if not tools:
-        return ""
-    items = []
-    for t in tools:
-        if not isinstance(t, dict):
-            continue
-        fn = t.get("function") if isinstance(t.get("function"), dict) else t
-        if not fn.get("name"):
-            continue
-        desc = fn.get("description") or ""
-        items.append("%d. %s%s\n   参数：\n%s" % (
-            len(items) + 1, fn["name"], (" — " + desc) if desc else "",
-            _describe_params(fn.get("parameters"))))
-    if not items:
-        return ""
-    return _TOOL_PROTOCOL_HEAD + "\n".join(items) + "\n"
 
-
-_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*([\s\S]*?)```")
-
-
-def _as_tool_calls(obj) -> list[dict] | None:
-    """把解析出的 JSON 转成 OpenAI tool_calls；不像工具调用就返回 None。"""
-    raw = obj if isinstance(obj, list) else [obj]
-    if not raw:
-        return None
-    out = []
-    for item in raw:
-        if not isinstance(item, dict):
-            return None
-        name = item.get("tool") or item.get("name") or item.get("function")
-        if not isinstance(name, str) or not name:
-            return None
-        args = item.get("arguments")
-        if args is None:
-            args = item.get("parameters") or item.get("args") or {}
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
-        out.append({"id": "call_" + uuid.uuid4().hex[:20], "type": "function",
-                    "function": {"name": name, "arguments": args}})
-    return out or None
-
-
-def parse_tool_calls(text: str) -> tuple[list[dict] | None, str]:
-    """从模型输出里抽出工具调用。
-
-    返回 (tool_calls, 剩余文本)；抽不到就返回 (None, 原文)。
-    支持多种形态：
-    1) ```json ... ``` 代码块；
-    2) 裸 JSON（或带有前导 json/JSON 关键字）；
-    3) 文本中内嵌的完整 JSON 对象或数组。
-    """
-    if not text:
-        return None, text
-    for m in reversed(list(_FENCE_RE.finditer(text))):
+    def __init__(self, request: Request | None, messages: list[ChatMessage], timeout: int):
+        headers = request.headers if request is not None else {}
+        key = CHAT_SESSIONS.key(headers.get("x-claude-code-session-id"),
+                                headers.get("x-claude-code-agent-id"))
+        if key and _is_side_request(messages):
+            # 输入建议等后台请求共用会话 ID，但不属于主对话；写进绑定 thread 会污染它，
+            # 还会让下一轮主对话的历史前缀对不上而被误判为压缩。
+            log.info("chat_session mode=side key=%s", key[:10])
+            key = None
+        self.token = CHAT_SESSIONS.try_begin(key, ttl=timeout + 60) if key else None
+        if key and not self.token:
+            raise HTTPException(409, "该 Claude 会话上一轮仍在运行")
+        self.key = key
+        self.thread: list[str | None] = []
+        self.tools_sig = ""
         try:
-            calls = _as_tool_calls(json.loads(m.group(1).strip()))
-        except Exception:
-            continue
-        if calls:
-            return calls, (text[:m.start()] + text[m.end():]).strip()
+            self.plan: SessionPlan = CHAT_SESSIONS.plan(key, messages)
+            if self.plan.account_id:
+                acc = store.get_account(self.plan.account_id)
+                if not acc or not acc.get("enabled", True) or not acc.get("cookies"):
+                    raise HTTPException(409, "该 Claude 会话绑定的 Muse 账号不可用；不会切换账号或新建 thread")
+            else:
+                acc = store.pick_account(rotate=True)
+                if not acc:
+                    raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+        except BaseException:
+            self.close()
+            raise
+        self.account = acc
+        if key:
+            log.info("chat_session mode=%s key=%s", self.plan.mode, key[:10])
 
-    stripped = text.strip()
-    clean_stripped = re.sub(r"^(?:```)?(?:json|JSON)?\s*", "", stripped).rstrip("`").strip()
-    if clean_stripped.startswith(("{", "[")):
+    @property
+    def stream_kwargs(self) -> dict:
+        """传给 safe_chat_stream：绑定会话固定账号、续轮回到原 thread、结束时回报 URL。"""
+        if not self.plan.bound:
+            return {}
+        return {"thread_id": self.plan.thread_id, "on_thread": self.thread.append,
+                "pin_account": True}
+
+    def prompt(self, build) -> str:
+        return build(self.plan.messages)
+
+    def with_tools(self, prompt: str, tools: list | None, tool_choice=None) -> str:
+        """接上工具协议。续轮且工具清单与该 thread 已发过的完全相同时，只发简短提醒。
+
+        清单变化（例如 ToolSearch 新加载了 MCP 工具）、新开或重绑 thread 时发完整清单。
+        """
+        if not CFG.tool_protocol:
+            return prompt
+        sig = tools_signature(tools) if tool_choice_value(tool_choice) != "none" else ""
+        if (sig and self.plan.mode == "continue" and self.plan.tools_sent == sig):
+            note = build_tools_reminder(tools, tool_choice)
+            self.tools_sig = sig
+        else:
+            note = build_tools_prompt(tools, tool_choice)
+            # 本轮没发完整清单（无工具或 none）时沿用上次记录，保证下轮判断准确。
+            self.tools_sig = sig if note else self.plan.tools_sent
+        return prompt + "\n\n" + note if note else prompt
+
+    def commit(self) -> None:
+        """本轮正常结束后调用；失败、取消不调用，绑定保持上次成功状态。"""
+        if not self.plan.bound:
+            return
+        found = next((t for t in reversed(self.thread) if t), None)
         try:
-            calls = _as_tool_calls(json.loads(clean_stripped))
-            if calls:
-                return calls, ""
-        except Exception:
-            pass
+            CHAT_SESSIONS.commit(self.plan, found, self.account["id"], token=self.token,
+                                 tools_sig=self.tools_sig)
+        except ValueError as exc:
+            # 绑定没写入就报成功，下一轮会悄悄另开 thread；按失败返回。
+            raise MuseGenerationError(f"会话绑定未能写入：{exc}") from exc
 
-    m_json = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
-    if m_json:
-        try:
-            calls = _as_tool_calls(json.loads(m_json.group(1).strip()))
-            if calls:
-                rest = (text[:m_json.start()] + text[m_json.end():]).strip()
-                if re.sub(r"^(?:```)?(?:json|JSON)?\s*", "", rest).strip("`").strip() == "":
-                    rest = ""
-                return calls, rest
-        except Exception:
-            pass
+    def close(self) -> None:
+        if self.key and self.token:
+            CHAT_SESSIONS.end(self.key, self.token)
+        self.key = self.token = None
 
-    return None, text
+
+# Claude Code 的后台附带请求标记；它们带同一个会话 ID，但不是主对话的一轮。
+_SIDE_REQUEST_MARKERS = ("[SUGGESTION MODE:",)
+
+
+def _is_side_request(messages: list[ChatMessage]) -> bool:
+    last = next((m for m in reversed(messages) if (m.role or "").lower() == "user"), None)
+    if last is None:
+        return False
+    head = _content_text(last.content).lstrip()[:4000]
+    return any(line.lstrip().startswith(_SIDE_REQUEST_MARKERS) for line in head.splitlines())
+
+
+def _generate_tool_reply(cookies, prompt, expires, timeout, account_id,
+                         tools, tool_choice=None, thread_id=None,
+                         on_thread=None, pin_account=False) -> tuple[str, list[dict] | None]:
+    """每轮只生成一次；用显式协议解析工具，避免整段重试放大延迟与重复调用。"""
+    final = []
+    raw = "".join(safe_chat_stream(
+        cookies, prompt, expires, timeout, account_id=account_id,
+        expect_tools=True, on_final_text=final.append, thread_id=thread_id,
+        on_thread=on_thread, pin_account=pin_account))
+    source = final[-1] if final else raw
+    calls, rest = parse_tool_calls(source, tools)
+    return (rest if calls else source), calls
 
 
 def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
@@ -1558,7 +1765,7 @@ _SSE_HEADERS = {
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, _=Depends(auth)):
+async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(auth)):
     """OpenAI 兼容的对话接口 —— 各类智能体客户端都能接。
 
     说明：muse.ai 网页是**自动路由**的 agent，界面上没有模型选择器，所有请求
@@ -1570,23 +1777,26 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     对话与生图/生视频共用同一个浏览器实例，靠 `GEN_LOCK` 串行。
     """
-    prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
+    timeout = int(req.timeout or CFG.chat_timeout)
+    if not req.messages:
+        prompt = (req.prompt or "").strip()
+        if not prompt:
+            raise HTTPException(400, "messages 为空")
+        req.messages = [ChatMessage(role="user", content=prompt)]
+    # 带 X-Claude-Code-Session-Id 时按 CHATSESS 绑定到同一个 Muse thread。
+    turn = ChatTurn(request, req.messages, timeout)
+    prompt = turn.prompt(build_chat_prompt)
     if not prompt:
+        turn.close()
         raise HTTPException(400, "messages 为空")
 
     # 工具调用协议默认不注入 —— 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"，
     # 注入反而污染正常回答；详见 config.py 的 tool_protocol 注释。
-    tool_note = build_tools_prompt(req.tools) if CFG.tool_protocol else ""
-    if tool_note:
-        # 放在末尾：开头是 agent 自己的 system 提示，夹在中间容易被忽略；
-        # 紧贴用户消息之前，模型对末尾指令的遵守度明显更高。
-        prompt = prompt + "\n\n" + tool_note
-
+    tool_note = bool(build_tools_prompt(req.tools, req.tool_choice)) if CFG.tool_protocol else False
+    prompt = turn.with_tools(prompt, req.tools, req.tool_choice)
     model = resolve_model(req.model, default="muse-spark")
-    timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    acc = turn.account
+    extra = turn.stream_kwargs
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -1609,46 +1819,29 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
                 if not tool_note:
-                    for chunk in stream_gen:
+                    for chunk in safe_chat_stream(cookies, prompt, expires, timeout,
+                                                  account_id=acc_id, **extra):
                         for piece in _pace_text(chunk):
                             yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                    turn.commit()
                     yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 else:
-                    buf, mode = "", None
-                    for chunk in stream_gen:
-                        if mode == "text":
-                            for piece in _pace_text(chunk):
-                                yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
-                            continue
-                        buf += chunk
-                        if mode is None:
-                            head = buf.lstrip()
-                            if len(head) >= 2:
-                                if head[0] in "{[" or head.startswith("```"):
-                                    mode = "maybe_tool"
-                                else:
-                                    mode = "text"
-                                    for piece in _pace_text(buf):
-                                        yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
-                                    buf = ""
-                    if mode == "text":
-                        yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                    # 带工具时先收完整段再解析。模型若抢先在云端沙箱执行，会再要求一次工具调用。
+                    rest, calls = _generate_tool_reply(
+                        cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
+                        **extra)
+                    turn.commit()
+                    if calls:
+                        if rest:
+                            yield _sse(_chat_chunk(cid, created, model, {"content": rest}))
+                        for piece in tool_call_deltas(calls):
+                            yield _sse(_chat_chunk(cid, created, model, {"tool_calls": piece}))
+                        yield _sse(_chat_chunk(cid, created, model, {}, finish="tool_calls"))
                     else:
-                        calls, rest = parse_tool_calls(buf)
-                        if calls:
-                            if rest:
-                                for piece in _pace_text(rest):
-                                    yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
-                            for piece in tool_call_deltas(calls):
-                                yield _sse(_chat_chunk(cid, created, model, {"tool_calls": piece}))
-                            yield _sse(_chat_chunk(cid, created, model, {}, finish="tool_calls"))
-                        else:
-                            if buf:
-                                for piece in _pace_text(buf):
-                                    yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
-                            yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                        for piece in _pace_text(rest):
+                            yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
+                        yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 if _want_usage(req.stream_options):
                     yield _sse({"id": cid, "object": "chat.completion.chunk",
                                 "created": created, "model": model,
@@ -1668,29 +1861,39 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
             except Exception as exc:
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+            finally:
+                turn.close()
+        return StreamingResponse(
+            stream_with_heartbeat(sync_stream, ": keepalive\n\n", on_done=turn.close),
+            media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+    def run():
+        if tool_note:
+            return _generate_tool_reply(
+                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice, **extra)
+        text = "".join(safe_chat_stream(cookies, prompt, expires, timeout,
+                                        account_id=acc_id, **extra))
+        return text, None
 
     try:
-        text = await asyncio.to_thread(run)
+        text, calls = await run_cancellable(run, request)
+        turn.commit()
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc))
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc))
+    finally:
+        turn.close()
 
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    if tool_note:
-        calls, rest = parse_tool_calls(text)
-        if calls:
-            return {"id": cid, "object": "chat.completion", "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "finish_reason": "tool_calls",
-                                 "message": {"role": "assistant",
-                                             "content": rest or None,
-                                             "tool_calls": calls}}],
-                    "usage": usage}
+    if calls:
+        return {"id": cid, "object": "chat.completion", "created": created,
+                "model": model,
+                "choices": [{"index": 0, "finish_reason": "tool_calls",
+                             "message": {"role": "assistant",
+                                         "content": text or None,
+                                         "tool_calls": calls}}],
+                "usage": usage}
     return {"id": cid, "object": "chat.completion", "created": created,
             "model": model,
             "choices": [{"index": 0, "finish_reason": "stop",
@@ -1715,17 +1918,18 @@ def _responses_messages(req: ResponsesRequest) -> list[ChatMessage]:
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
-            if item.get("role"):                      # message 形态
-                msgs.append(ChatMessage(role=item["role"],
-                                        content=item.get("content")))
+            if itype == "function_call":
+                msgs.append(ChatMessage(role="assistant", tool_calls=[{
+                    "function": {"name": item.get("name"),
+                                 "arguments": item.get("arguments") or "{}"}}]))
+            elif itype == "function_call_output":
+                msgs.append(ChatMessage(role="tool",
+                                        content=str(item.get("output") or "")))
             elif itype == "input_text":
                 msgs.append(ChatMessage(role="user", content=item.get("text")))
-            elif itype == "function_call_output":
-                msgs.append(ChatMessage(role="user", content="【工具执行结果】\n"
-                                        + str(item.get("output") or "")))
-            elif itype == "function_call":
-                msgs.append(ChatMessage(role="assistant", content="【请求调用工具】"
-                                        + str(item.get("name") or "")))
+            elif item.get("role"):                      # message 形态
+                msgs.append(ChatMessage(role=item["role"],
+                                        content=item.get("content")))
     return msgs
 
 
@@ -1733,18 +1937,87 @@ def _sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _response_output(mid: str, text: str, calls: list[dict] | None) -> list[dict]:
+    """Responses API 的 output：正文是 message，工具调用是 function_call。"""
+    output = []
+    if text:
+        output.append({"type": "message", "id": mid, "role": "assistant",
+                       "status": "completed",
+                       "content": [{"type": "output_text", "text": text,
+                                    "annotations": []}]})
+    for call in calls or []:
+        output.append({"type": "function_call", "id": "fc_" + call["id"][5:],
+                       "call_id": call["id"], "name": call["function"]["name"],
+                       "arguments": call["function"]["arguments"],
+                       "status": "completed"})
+    return output
+
+
+def _emit_response_text(rid: str, mid: str, index: int, text: str, paced: bool = True):
+    """按 Responses 的事件顺序发出一条完整的文本 output。"""
+    item = {"id": mid, "type": "message", "role": "assistant",
+            "status": "in_progress", "content": []}
+    yield _sse_event("response.output_item.added", {
+        "type": "response.output_item.added", "response_id": rid,
+        "output_index": index, "item": item})
+    yield _sse_event("response.content_part.added", {
+        "type": "response.content_part.added", "response_id": rid,
+        "item_id": mid, "output_index": index, "content_index": 0,
+        "part": {"type": "output_text", "text": "", "annotations": []}})
+    for piece in (_pace_text(text) if paced else (text,)):
+        yield _sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta", "response_id": rid,
+            "item_id": mid, "output_index": index, "content_index": 0,
+            "delta": piece})
+    yield _sse_event("response.output_text.done", {
+        "type": "response.output_text.done", "response_id": rid,
+        "item_id": mid, "output_index": index, "content_index": 0, "text": text})
+    item = {"id": mid, "type": "message", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]}
+    yield _sse_event("response.output_item.done", {
+        "type": "response.output_item.done", "response_id": rid,
+        "output_index": index, "item": item})
+
+
+def _emit_response_calls(rid: str, start: int, calls: list[dict]):
+    """每个工具调用：added（空参数）→ arguments.delta → arguments.done → item.done。"""
+    for offset, call in enumerate(calls):
+        index = start + offset
+        name = call["function"]["name"]
+        arguments = call["function"]["arguments"]
+        item_id = "fc_" + call["id"][5:]
+        base = {"type": "function_call", "id": item_id, "call_id": call["id"],
+                "name": name, "status": "in_progress"}
+        yield _sse_event("response.output_item.added", {
+            "type": "response.output_item.added", "response_id": rid,
+            "output_index": index, "item": {**base, "arguments": ""}})
+        yield _sse_event("response.function_call_arguments.delta", {
+            "type": "response.function_call_arguments.delta", "response_id": rid,
+            "item_id": item_id, "output_index": index, "delta": arguments})
+        yield _sse_event("response.function_call_arguments.done", {
+            "type": "response.function_call_arguments.done", "response_id": rid,
+            "item_id": item_id, "output_index": index, "arguments": arguments})
+        yield _sse_event("response.output_item.done", {
+            "type": "response.output_item.done", "response_id": rid,
+            "output_index": index,
+            "item": {**base, "arguments": arguments, "status": "completed"}})
+
+
 @app.post("/v1/responses")
 async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     """OpenAI Responses API —— 新版 Codex 默认走这个端点。
 
-    只实现 Codex 实际用到的子集：文本进 → 文本出（含流式事件）。
-    muse.ai 不会返回结构化的 tool_calls，关于工具调用的边界见 README。
+    文本照常以 output_text 流出。带 tools 时先收完整段回复再解析：
+    模型按协议输出的 JSON 变成 function_call，而不是混在正文里。
     """
     prompt = build_chat_prompt(_responses_messages(req))
     if not prompt:
         raise HTTPException(400, "input 为空")
-
+    has_tools = bool(CFG.tool_protocol and build_tools_prompt(req.tools, req.tool_choice))
+    prompt = _with_tools(prompt, req.tools, req.tool_choice)
     model = resolve_model(req.model, default="muse-spark")
+
     timeout = int(req.timeout or CFG.chat_timeout)
     acc = store.pick_account(rotate=True)
     if not acc:
@@ -1755,68 +2028,346 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     created = int(time.time())
     acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
 
-    def envelope(status: str, text: str = "") -> dict:
-        done = status == "completed"
+    def envelope(status: str, text: str = "", calls: list[dict] | None = None) -> dict:
         return {"id": rid, "object": "response", "created_at": created,
                 "status": status, "model": model,
-                "output": [{"type": "message", "id": mid, "role": "assistant",
-                            "status": "completed" if done else "in_progress",
-                            "content": ([{"type": "output_text", "text": text,
-                                          "annotations": []}] if text else [])}],
+                "output": (_response_output(mid, text, calls)
+                           if status == "completed" else []),
                 "usage": {"input_tokens": 0, "output_tokens": 0,
                           "total_tokens": 0}}
 
     if req.stream:
-        def sync_stream():
+        def sync_stream_live():
             try:
                 yield _sse_event("response.created", {
                     "type": "response.created",
                     "response": envelope("in_progress")})
-                yield _sse_event("response.output_item.added", {
-                    "type": "response.output_item.added", "output_index": 0,
-                    "item": {"id": mid, "type": "message", "role": "assistant",
-                             "status": "in_progress", "content": []}})
-                yield _sse_event("response.content_part.added", {
-                    "type": "response.content_part.added", "item_id": mid,
-                    "output_index": 0, "content_index": 0,
-                    "part": {"type": "output_text", "text": "",
-                             "annotations": []}})
-                full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
-                    full += chunk
-                    yield _sse_event("response.output_text.delta", {
-                        "type": "response.output_text.delta", "item_id": mid,
-                        "output_index": 0, "content_index": 0, "delta": chunk})
-                yield _sse_event("response.output_text.done", {
-                    "type": "response.output_text.done", "item_id": mid,
-                    "output_index": 0, "content_index": 0, "text": full})
-                yield _sse_event("response.output_item.done", {
-                    "type": "response.output_item.done", "output_index": 0,
-                    "item": {"id": mid, "type": "message", "role": "assistant",
-                             "status": "completed",
-                             "content": [{"type": "output_text", "text": full,
-                                          "annotations": []}]}})
+                if not has_tools:
+                    yield from _emit_response_text_live()
+                    return
+                text, calls = _generate_tool_reply(
+                    cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice)
+                if text:
+                    yield from _emit_response_text(rid, mid, 0, text, paced=not calls)
+                if calls:
+                    yield from _emit_response_calls(rid, 1 if text else 0, calls)
                 yield _sse_event("response.completed", {
                     "type": "response.completed",
-                    "response": envelope("completed", full)})
+                    "response": envelope("completed", text, calls)})
+                store.mark(acc_id, True, "")
             except Exception as exc:  # noqa: BLE001
                 log.warning("responses 流式失败: %s", exc)
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
                     "response": envelope("failed")})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        def _emit_response_text_live():
+            yield _sse_event("response.output_item.added", {
+                "type": "response.output_item.added", "response_id": rid,
+                "output_index": 0,
+                "item": {"id": mid, "type": "message", "role": "assistant",
+                         "status": "in_progress", "content": []}})
+            yield _sse_event("response.content_part.added", {
+                "type": "response.content_part.added", "response_id": rid,
+                "item_id": mid, "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []}})
+            full = ""
+            for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                full += chunk
+                yield _sse_event("response.output_text.delta", {
+                    "type": "response.output_text.delta", "response_id": rid,
+                    "item_id": mid, "output_index": 0, "content_index": 0,
+                    "delta": chunk})
+            yield _sse_event("response.output_text.done", {
+                "type": "response.output_text.done", "response_id": rid,
+                "item_id": mid, "output_index": 0, "content_index": 0, "text": full})
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done", "response_id": rid,
+                "output_index": 0,
+                "item": {"id": mid, "type": "message", "role": "assistant",
+                         "status": "completed",
+                         "content": [{"type": "output_text", "text": full,
+                                      "annotations": []}]}})
+            yield _sse_event("response.completed", {
+                "type": "response.completed",
+                "response": envelope("completed", full)})
+            store.mark(acc_id, True, "")
+
+        return StreamingResponse(
+            stream_with_heartbeat(sync_stream_live, ": keepalive\n\n"),
+            media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    def run_response():
+        if has_tools:
+            return _generate_tool_reply(
+                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice)
+        return "".join(safe_chat_stream(
+            cookies, prompt, expires, timeout, account_id=acc_id)), None
 
     try:
-        text = await asyncio.to_thread(run)
+        text, calls = await asyncio.to_thread(run_response)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc))
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc))
+    store.mark(acc_id, True, "")
+    return envelope("completed", text, calls)
 
-    return envelope("completed", text)
+
+def _block_text(content) -> str:
+    """Anthropic 的 text/image content blocks 转成适合网页模型的纯文本占位。"""
+    if isinstance(content, str) or content is None:
+        return content or ""
+    if not isinstance(content, list):
+        return str(content)
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind in (None, "text"):
+            parts.append(str(block.get("text") or ""))
+        elif kind == "image":
+            parts.append("[图片/截图结果]")
+        elif kind == "document":
+            parts.append("[文档结果]")
+    return "\n".join(p for p in parts if p)
+
+
+def _messages_to_chat(req: MessagesRequest) -> list[ChatMessage]:
+    """Anthropic messages 转内部 transcript，同时保留 tool_use/tool_result 关联。"""
+    msgs: list[ChatMessage] = []
+    system = _block_text(req.system).strip()
+    if system:
+        msgs.append(ChatMessage(role="system", content=system))
+    tool_names: dict[str, str] = {}
+    for message in req.messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role") or "user"
+        content = message.get("content")
+        if isinstance(content, list):
+            calls = []
+            results = []
+            text_parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    if isinstance(block, str):
+                        text_parts.append(block)
+                    continue
+                kind = block.get("type")
+                if kind == "tool_use":
+                    call_id = str(block.get("id") or "")
+                    name = str(block.get("name") or "")
+                    if call_id:
+                        tool_names[call_id] = name
+                    calls.append({"id": call_id, "type": "function",
+                                  "function": {"name": name,
+                                               "arguments": block.get("input") or {}}})
+                elif kind == "tool_result":
+                    call_id = str(block.get("tool_use_id") or "")
+                    result = _block_text(block.get("content"))
+                    if block.get("is_error"):
+                        result = "【工具执行失败】\n" + result
+                    results.append(ChatMessage(
+                        role="tool", name=tool_names.get(call_id, ""),
+                        tool_call_id=call_id, content=result))
+                else:
+                    text_parts.append(_block_text([block]))
+            text = "\n".join(part for part in text_parts if part).strip()
+            if text or calls:
+                msgs.append(ChatMessage(role=role, content=text or None,
+                                        tool_calls=calls or None))
+            msgs.extend(results)
+        else:
+            msgs.append(ChatMessage(role=role, content=_block_text(content).strip() or None))
+    return msgs
+
+
+def _message_body(mid: str, model: str, text: str, calls: list[dict] | None) -> dict:
+    """Anthropic Message：正文是 text 块，工具调用是 tool_use 块。"""
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for call in calls or []:
+        try:
+            tool_input = json.loads(call["function"]["arguments"])
+        except Exception:
+            tool_input = {"raw": call["function"]["arguments"]}
+        content.append({"type": "tool_use", "id": call["id"],
+                        "name": call["function"]["name"], "input": tool_input})
+    return {"id": mid, "type": "message", "role": "assistant", "model": model,
+            "content": content,
+            "stop_reason": "tool_use" if calls else "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}
+
+
+def _message_text_deltas(index: int, text: str):
+    """网页批量刷新时拆成小片；单个 DOM 批次的展示延迟最多两秒。"""
+    pieces = max(1, (len(text) + 3) // 4)
+    delay = min(0.012, 2.0 / max(1, pieces - 1))
+    for offset in range(0, len(text), 4):
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": index,
+            "delta": {"type": "text_delta", "text": text[offset:offset + 4]}})
+        if offset + 4 < len(text) and delay:
+            time.sleep(delay)
+
+
+def _emit_message_text(index: int, text: str, paced: bool = True):
+    yield _sse_event("content_block_start", {
+        "type": "content_block_start", "index": index,
+        "content_block": {"type": "text", "text": ""}})
+    for piece in (_pace_text(text) if paced else (text,)):
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": index,
+            "delta": {"type": "text_delta", "text": piece}})
+    yield _sse_event("content_block_stop", {
+        "type": "content_block_stop", "index": index})
+
+
+def _emit_message_calls(start: int, calls: list[dict]):
+    """tool_use 先给空 input，参数整段放在一次 input_json_delta 里。"""
+    for offset, call in enumerate(calls):
+        index = start + offset
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "tool_use", "id": call["id"],
+                              "name": call["function"]["name"], "input": {}}})
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": index,
+            "delta": {"type": "input_json_delta",
+                      "partial_json": call["function"]["arguments"]}})
+        yield _sse_event("content_block_stop", {
+            "type": "content_block_stop", "index": index})
+
+
+@app.post("/v1/messages")
+async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(auth)):
+    """Anthropic Messages API。
+
+    工具定义用 input_schema，工具结果用 user 消息里的 tool_result 块。
+    模型按协议输出的 JSON 解析成 tool_use，stop_reason 为 tool_use。
+    带 X-Claude-Code-Session-Id 时按 CHATSESS 绑定到同一个 Muse thread。
+    """
+    incoming = _messages_to_chat(req)
+    if not incoming:
+        raise HTTPException(400, "messages 为空")
+    has_tools = bool(CFG.tool_protocol and build_tools_prompt(req.tools, req.tool_choice))
+    model = resolve_model(req.model, default="muse-spark")
+    timeout = int(req.timeout or CFG.chat_timeout)
+    turn = ChatTurn(request, incoming, timeout)
+    prompt = turn.prompt(_messages_prompt)
+    if not prompt:
+        turn.close()
+        raise HTTPException(400, "messages 为空")
+    prompt = turn.with_tools(prompt, req.tools, req.tool_choice)
+
+    mid = "msg_" + uuid.uuid4().hex[:24]
+    acc = turn.account
+    acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
+    extra = turn.stream_kwargs
+
+    if req.stream:
+        def sync_stream():
+            try:
+                opening = _message_body(mid, model, "", None)
+                opening["content"] = []
+                opening["stop_reason"] = None
+                yield _sse_event("message_start", {
+                    "type": "message_start", "message": opening})
+                calls = None
+                if has_tools:
+                    splitter = ToolStreamSplitter()
+                    final_text: list[str] = []
+                    streamed_prefix = ""
+                    text_started = False
+                    for chunk in safe_chat_stream(
+                            cookies, prompt, expires, timeout, account_id=acc_id,
+                            expect_tools=True, on_final_text=final_text.append, **extra):
+                        prefix = splitter.feed(chunk)
+                        if prefix:
+                            if not text_started:
+                                yield _sse_event("content_block_start", {
+                                    "type": "content_block_start", "index": 0,
+                                    "content_block": {"type": "text", "text": ""}})
+                                text_started = True
+                            streamed_prefix += prefix
+                            yield from _message_text_deltas(0, prefix)
+                    source = final_text[-1] if final_text else streamed_prefix + splitter.pending
+                    calls, rest = parse_tool_calls(source, req.tools)
+                    text = rest if calls else source
+                    sent = streamed_prefix.rstrip()
+                    normalized = text.lstrip()
+                    if sent and normalized.startswith(sent):
+                        remainder = normalized[len(sent):]
+                    elif not sent:
+                        remainder = text
+                    else:
+                        # DOM markdown 重渲染改写了已发正文；不重放。
+                        remainder = ""
+                    if remainder:
+                        if not text_started:
+                            yield _sse_event("content_block_start", {
+                                "type": "content_block_start", "index": 0,
+                                "content_block": {"type": "text", "text": ""}})
+                            text_started = True
+                        yield from _message_text_deltas(0, remainder)
+                    if text_started:
+                        yield _sse_event("content_block_stop", {
+                            "type": "content_block_stop", "index": 0})
+                    if calls:
+                        yield from _emit_message_calls(1 if text_started else 0, calls)
+                else:
+                    yield _sse_event("content_block_start", {
+                        "type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""}})
+                    for chunk in safe_chat_stream(
+                            cookies, prompt, expires, timeout, account_id=acc_id, **extra):
+                        yield from _message_text_deltas(0, chunk)
+                    yield _sse_event("content_block_stop", {
+                        "type": "content_block_stop", "index": 0})
+                turn.commit()
+                yield _sse_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "tool_use" if calls else "end_turn",
+                              "stop_sequence": None},
+                    "usage": {"output_tokens": 0}})
+                yield _sse_event("message_stop", {"type": "message_stop"})
+                store.mark(acc_id, True, "")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("messages 流式失败: %s", exc)
+                yield _sse_event("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(exc)}})
+            finally:
+                turn.close()
+        return StreamingResponse(
+            stream_with_heartbeat(sync_stream, ": keepalive\n\n", on_done=turn.close),
+            media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    def run_message():
+        if has_tools:
+            return _generate_tool_reply(
+                cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice, **extra)
+        return "".join(safe_chat_stream(
+            cookies, prompt, expires, timeout, account_id=acc_id, **extra)), None
+
+    try:
+        text, calls = await run_cancellable(run_message, request)
+        turn.commit()
+    except MuseAuthError as exc:
+        raise HTTPException(401, str(exc))
+    except MuseGenerationError as exc:
+        raise HTTPException(502, str(exc))
+    finally:
+        turn.close()
+    store.mark(acc_id, True, "")
+    return _message_body(mid, model, text, calls)
 
 
 @app.get("/v1/media/{name}")
@@ -2035,6 +2586,39 @@ async def test_account(aid: str, _=Depends(auth)):
     if not res["ok"]:
         return JSONResponse(res, status_code=200)
     return res
+
+
+class ThreadPruneRequest(BaseModel):
+    keep: int = Field(default=thread_prune.KEEP, ge=1, le=1000)
+    dry_run: bool = True
+
+
+@app.post("/admin/accounts/{aid}/threads/prune")
+async def prune_account_threads(aid: str, req: ThreadPruneRequest = Body(default_factory=ThreadPruneRequest),
+                                _=Depends(auth)):
+    """存量旁聊一次性清理（CHATPRUN-B06）；默认 dry_run 只返回计划，不删除。"""
+    acc = store.get_account(aid)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    if not acc.get("cookies"):
+        raise HTTPException(400, "该账号没有 cookie")
+
+    def _run():
+        with GEN_LOCK, _account_operation(aid) as acc:
+            engine.start()
+            engine.ensure_page(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+            return thread_prune.prune(engine.page, CHAT_SESSIONS.bound_thread_ids(),
+                                      keep=req.keep, max_delete=1 << 30, dry_run=req.dry_run)
+
+    try:
+        res = await asyncio.to_thread(_run)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"打开 Muse 页面失败：{type(exc).__name__}: {str(exc)[:200]}")
+    log.info("thread_prune manual account=%s dry_run=%s planned=%s deleted=%s error=%s",
+             aid, req.dry_run, res["planned"], res["deleted"], res["error"] or "-")
+    return {"ok": not res["error"], "dry_run": req.dry_run, **res}
 
 
 @app.post("/admin/accounts/{aid}/relogin")
@@ -2439,28 +3023,15 @@ async def run_keepalive_all(force: bool = False) -> dict:
 
 
 def _warmup_browser_sync():
-    """后台静默预热浏览器与首个可用账号的 WebSocket 隧道，使重启后首条请求也秒回。"""
-    if getattr(engine, "current_acc_id", None) and engine.page is not None:
-        return
+    """只预热共享 Chromium 进程；账号页面属于请求线程，不跨线程保留。"""
     if not GEN_LOCK.acquire(blocking=False):
         return
-    acc = None
     try:
-        acc = ACCOUNT_POOL.acquire(rotate=False, timeout=0.1, record_use=False)
-        log.info("【浏览器预热】正在后台预热账号 %s (%s) 的热备标签页...", acc.get("label"), acc["id"])
-        _bind_account_proxy(acc)
-        refreshed = _renew_and_persist(acc["id"], wake_vm=True, force=False) or acc
         engine.start()
-        engine.ensure_page(refreshed["cookies"], refreshed.get("cookies_exp"), account_id=acc["id"])
-        log.info("【浏览器预热】账号 %s (%s) 热备标签页与 WebSocket 已就绪", acc.get("label"), acc["id"])
+        log.info("【浏览器预热】Chromium/CDP 已就绪")
     except Exception as exc:  # noqa: BLE001
-        log.warning("【浏览器预热】预热异常: %s", exc)
+        log.warning("【浏览器预热】Chromium 预热失败: %s", exc)
     finally:
-        # Warmup runs in a worker thread; do not retain its account reservation or page.
-        engine.close_current_page()
-        _clear_account_proxy()
-        if acc:
-            ACCOUNT_POOL.release(acc["id"])
         GEN_LOCK.release()
 
 

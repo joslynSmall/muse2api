@@ -150,6 +150,10 @@ class Config:
     def tasks_file(self) -> str:
         return os.path.join(self.data_dir, "tasks.json")
 
+    @property
+    def chat_sessions_file(self) -> str:
+        return os.path.join(self.data_dir, "chat-sessions.json")
+
     def ensure_dirs(self):
         for d in (self.base_dir, self.data_dir, self.media_dir, self.download_dir,
                   self.profile_dir):

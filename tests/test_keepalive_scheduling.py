@@ -32,6 +32,20 @@ def test_maintenance_selection_does_not_count_as_use():
         assert acc["use_count"] == 8
 
 
+def test_startup_warmup_does_not_reserve_account_or_create_page():
+    calls = []
+    with patch.object(app.GEN_LOCK, "acquire", return_value=True), \
+         patch.object(app.GEN_LOCK, "release") as release, \
+         patch.object(app.ACCOUNT_POOL, "acquire") as acquire, \
+         patch.object(app.engine, "start", side_effect=lambda: calls.append("start")), \
+         patch.object(app.engine, "ensure_page", side_effect=AssertionError("page created")), \
+         patch.object(app.engine, "close_current_page", side_effect=AssertionError("page closed")):
+        app._warmup_browser_sync()
+    assert calls == ["start"]
+    acquire.assert_not_called()
+    release.assert_called_once_with()
+
+
 def test_keepalive_only_runs_when_due():
     now = 1_900_000_000
     original_store, original_cfg = app.store, app.CFG

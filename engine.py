@@ -34,6 +34,7 @@ import uuid
 import unicodedata
 
 from cdp import CDP, http_json
+import muse_events
 from proxy import HTTPProxyRelay, request_proxy_context
 
 log = logging.getLogger("muse2api")
@@ -516,6 +517,12 @@ class MuseEngine:
             page.send("Network.enable")
             page.send("Page.enable")
             page.send("Runtime.enable")
+            # 页面每次加载都先注入回复事件订阅（CHATSRC）；失败不影响 DOM 兜底。
+            try:
+                page.send("Page.addScriptToEvaluateOnNewDocument",
+                          {"source": muse_events.BOOTSTRAP_JS})
+            except Exception:  # noqa: BLE001
+                log.warning("注入回复事件订阅失败，将只用 DOM 读取", exc_info=True)
             page.send("Browser.setDownloadBehavior", {
                 "behavior": "allow", "downloadPath": self._new_download_dir(),
                 "browserContextId": ctx_id,
@@ -743,7 +750,8 @@ class MuseEngine:
         except Exception:
             pass
 
-    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
+    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None,
+                    thread_id: str | None = None):
         resolver = getattr(self, "proxy_resolver", None)
         local = self._ensure_local()
         # A lease snapshots routing; a concurrent config edit must never change its exit.
@@ -783,8 +791,21 @@ class MuseEngine:
         self.page = page  # Cleanup must also own pages that never become ready.
         self._ensure_local().proxy_config = proxy
         self._apply_cookies(page, cookies, expires)
-        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+        target = ("https://muse.ai/thread/" + thread_id) if thread_id else "https://muse.ai/thread/new"
+        page.send("Page.navigate", {"url": target})
         if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
+            if thread_id:
+                current = page.js("location.pathname") or ""
+                if current.rstrip("/") != "/thread/" + thread_id:
+                    self._close_page()
+                    raise MuseGenerationError("无法恢复已绑定的 Muse thread；为避免跨会话串线，已停止请求")
+                # 历史气泡在输入框就绪后才渲染；给它几秒，不把渲染延迟误判成空 thread。
+                restore_deadline = time.time() + 15.0
+                while not (self._user_count() and self._agent_count()) and time.time() < restore_deadline:
+                    time.sleep(0.2)
+                if not self._user_count() or not self._agent_count():
+                    self._close_page()
+                    raise MuseGenerationError("已绑定 Muse thread 未恢复既有对话内容；已停止以避免创建新会话")
             self.current_acc_id = account_id
             return page
         try:
@@ -1158,6 +1179,50 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return "error"
 
+    _SENT_STATE_JS = (
+        "(function(){"
+        "var ta=document.querySelector('textarea');"
+        "var bs=[].slice.call(document.querySelectorAll("
+        "'div[class*=\"hatch-chat-groupable-bubble\"]'));"
+        "var users=0;for(var i=0;i<bs.length;i++){"
+        "if(/chat-user-bubble/.test(bs[i].className||''))users++;}"
+        "return JSON.stringify({v:ta?ta.value:'',users:users});})()"
+    )
+
+    def _confirm_sent(self, base_users: int, state: str, timeout: float = 6.0) -> None:
+        """点击发送不等于送达：等输入框清空或出现新的用户气泡。
+
+        读不到页面状态时（连续两次异常）按已提交继续，避免把 CDP 抖动误判成
+        发送失败；能读到状态但输入框仍有文字则明确报错。
+        """
+        if not self.page:
+            return
+        deadline = time.monotonic() + timeout
+        unreadable = 0
+        while True:
+            try:
+                raw = self.page.js(self._SENT_STATE_JS, timeout=5)
+                if not raw:
+                    raise ValueError("empty composer state")
+                snapshot = json.loads(raw)
+                value = snapshot.get("v", "")
+                users = int(snapshot.get("users") or 0)
+            except Exception:  # noqa: BLE001
+                unreadable += 1
+                if unreadable >= 2:
+                    log.warning("发送后无法读取输入框状态（%s），按已提交继续", state)
+                    return
+            else:
+                unreadable = 0
+                if not str(value).strip() or users > base_users:
+                    return
+            if time.monotonic() >= deadline:
+                if unreadable:
+                    log.warning("发送后无法读取输入框状态（%s），按已提交继续", state)
+                    return
+                raise MuseGenerationError("提示词未能提交到 muse.ai（发送后输入框仍有内容）")
+            time.sleep(0.1)
+
     # ---------------- 等待生成 ----------------
     def _last_attachment(self) -> dict | None:
         atts = self.attachments()
@@ -1424,13 +1489,55 @@ class MuseEngine:
     """
 
     # ---------------- 文本 / 代码对话 ----------------
+    _CHAT_TEXT_FN_JS = r"""function(root){
+        // 保留可见正文结构；URL 在 DOM 源头序列化，代码块保持字面值。
+        function read(node){
+            if(node.nodeType===Node.TEXT_NODE)return node.nodeValue||'';
+            if(node.nodeType!==Node.ELEMENT_NODE)return '';
+            var style=getComputedStyle(node);
+            if(style.display==='none'||style.visibility==='hidden'||node.hidden)return '';
+            var tag=node.tagName;
+            if(tag==='SCRIPT'||tag==='STYLE'||tag==='BUTTON')return '';
+            if(tag==='PRE'||tag==='CODE')return node.innerText||'';
+            if(tag==='BR')return '\n';
+            var text=Array.from(node.childNodes).map(read).join('');
+            if(tag==='A'){
+                var raw=node.getAttribute('href');
+                if(raw){
+                    try{
+                        var url=new URL(raw,document.baseURI);
+                        if(url.hostname==='l.meta.ai'){
+                            var target=url.searchParams.get('u');
+                            if(target){
+                                var unwrapped=new URL(target);
+                                if(unwrapped.protocol==='https:'||unwrapped.protocol==='http:')url=unwrapped;
+                            }
+                        }
+                        if((url.protocol==='https:'||url.protocol==='http:')&&!url.username&&!url.password){
+                            var label=text.trim();
+                            if(label===url.href)return label;
+                            var escaped=(label||url.href).replace(/\\/g,'\\\\').replace(/\[/g,'\\[').replace(/\]/g,'\\]');
+                            return '['+escaped+'](<'+url.href.replace(/>/g,'%3E')+'>)';
+                        }
+                    }catch(e){}
+                }
+                return text;
+            }
+            if(/^(P|DIV|SECTION|ARTICLE|H[1-6]|BLOCKQUOTE|UL|OL|LI|TABLE|TR)$/.test(tag)){
+                return '\n'+text+'\n';
+            }
+            if(tag==='TD'||tag==='TH')return text+'\t';
+            return text;
+        }
+        return read(root).replace(/\n{3,}/g,'\n\n').trim();
+    }"""
     _AGENT_TEXT_JS = (
-        "(function(){"
+        "(function(){var textOf=" + _CHAT_TEXT_FN_JS + ";"
         "var bs=[].slice.call(document.querySelectorAll("
         "'div[class*=\"hatch-chat-groupable-bubble\"]'));"
         "for(var i=bs.length-1;i>=0;i--){"
         "var cs=bs[i].className||'';"
-        "if(/hatch-agent-bubble-bg/.test(cs))return bs[i].innerText||'';}"
+        "if(/hatch-agent-bubble-bg/.test(cs))return textOf(bs[i]);}"
         "return '';})()"
     )
     _USER_COUNT_JS = (
@@ -1459,11 +1566,14 @@ class MuseEngine:
         "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
-        "var nonEmpty=bs.filter(function(b){return ((b.innerText||'').trim().length)>0;});"
-        "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"
-        "var stop=!!(document.querySelector('[data-testid=\"hatch-composer-stop-button\"]')"
-        "||document.querySelector('button[aria-label*=\"Stop\" i]')"
-        "||document.querySelector('button[aria-label*=\"停止\"]'));"
+        "var textOf=" + _CHAT_TEXT_FN_JS + ";"
+        "var nonEmpty=bs.filter(function(b){return textOf(b).length>0;});"
+        "var txt=nonEmpty.length?textOf(nonEmpty[nonEmpty.length-1]):'';"
+        "var stopEls=[].slice.call(document.querySelectorAll("
+        "'[data-testid=\"hatch-composer-stop-button\"],'"
+        "+'button[aria-label*=\"Stop\" i],button[aria-label*=\"停止\"]'));"
+        "var stop=stopEls.some(function(e){return e.getClientRects().length>0"
+        "&&getComputedStyle(e).visibility!=='hidden';});"
         "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})()"
     )
 
@@ -1496,51 +1606,166 @@ class MuseEngine:
             pass
         return 0, "", False
 
+    def chat_snapshot(self, base_agent: int = 0) -> str:
+        """最后一条非空助手气泡的完整文本；DOM 重渲染时作为可靠最终快照。
+
+        ``base_agent`` 是发送前的气泡数；虚拟列表卸载旧气泡时若读不到明显属于
+        新回复的快照，返回空串，让调用方保留最后一次流式快照。
+        """
+        cnt, text, _ = self._poll_chat()
+        if cnt > base_agent and text:
+            return text
+        return (text or self._agent_text()) if base_agent == 0 else ""
+
+    @staticmethod
+    def _stream_delta(emitted: str, current: str) -> tuple[str, str]:
+        """为会重渲染的气泡计算只增不减的增量。
+
+        muse 会把气泡重写成 markdown / 代码块 / tool_call 区块，``current`` 不总是
+        以已发送文本为前缀。非前缀重写时绝不能把全文再拼一次：有新增后缀时只发
+        后缀；markdown 缩短或完全改写时只同步快照，等待后续增量；短暂变短时保持
+        已发送文本，等待渲染恢复。返回 (delta, next_emitted)。
+        """
+        if not current:
+            return "", emitted
+        if current == emitted:
+            return "", emitted
+        if not emitted:
+            return current, current
+        if current.startswith(emitted):
+            return current[len(emitted):], current
+        if emitted.startswith(current):
+            # 渲染器暂时丢了尾部；等它恢复，避免重复发送已发内容。
+            return "", emitted
+        if current in emitted:
+            # markdown 重写（例如去掉 ** 标记）后文本变短但内容已发送；
+            # 同步到新快照，后续增长仍能按前缀继续流式输出。
+            return "", current
+        common = 0
+        limit = min(len(emitted), len(current))
+        while common < limit and emitted[common] == current[common]:
+            common += 1
+        if common == 0:
+            # 完全不同的快照：绝不把整段文本再拼一次；同步后等待后续增量，
+            # 最终文本由 on_final_text / chat_snapshot 提供。
+            return "", current
+        return current[common:], current
+
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
-        timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
-        self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
-        base_agent, base_text, _ = self._poll_chat()
-        self._send(prompt)
+                    stop_event=None, expect_tools: bool = False,
+                    on_final_text=None, on_timing=None, thread_id: str | None = None,
+                    on_thread=None):
+        """发一条消息，流式 yield 增量文本。
 
-        t_sent = time.time()
+        工具请求的首字窗口为 90 秒；Stop 按钮仍在时静默不算完成，Stop 消失后
+        重新开始静默计时。DOM 重渲染可能让增量流不等于最终文本，正常结束时通过
+        ``on_final_text(full_text)`` 交回最后一条助手气泡的完整快照，供工具解析
+        使用；取消或超时不会触发该回调。
+        """
+        timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
+        started = time.monotonic()
+        self.ensure_page(cookies, expires, account_id=account_id, thread_id=thread_id)
+        if on_timing:
+            on_timing("page_ready_ms", round((time.monotonic() - started) * 1000))
+        stage = time.monotonic()
+        if not thread_id:
+            self.reset_thread(for_chat=True)
+        elif (self.page.js("location.pathname") or "").rstrip("/") != "/thread/" + thread_id:
+            raise MuseGenerationError("已绑定 Muse thread 的页面位置不符；拒绝新建会话")
+        if on_timing:
+            on_timing("thread_reset_ms", round((time.monotonic() - stage) * 1000))
+        base_agent, _, _ = self._poll_chat()
+        base_users = self._user_count()
+        if thread_id and base_users == 0 and base_agent == 0:
+            raise MuseGenerationError("已绑定的 Muse thread 为空或不可读；拒绝发送以免创建替代会话")
+        # 发送前清空事件队列：此前的事件（历史回放、上一轮）都不属于本次回复。
+        assembler = muse_events.ReplyAssembler()
+        drained = self._drain_events()
+        for record in (drained[1] if drained else []):
+            assembler.note_existing(record)
+        stage = time.monotonic()
+        sent_state = self._send(prompt)
+        if sent_state not in ("clicked", "enter-sent"):
+            raise MuseGenerationError(f"提示词未能提交到 muse.ai（{sent_state}）")
+        if on_timing:
+            on_timing("send_ms", round((time.monotonic() - stage) * 1000))
+        stage = time.monotonic()
+        self._confirm_sent(base_users, sent_state)
+        if on_timing:
+            on_timing("send_confirm_ms", round((time.monotonic() - stage) * 1000))
+
+        t_sent = time.monotonic()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
-        sent, last, stable = "", None, 0
+        first_wait = 90.0 if expect_tools else 40.0
+        first_token_deadline = min(deadline, t_sent + first_wait)
+
+        if drained is not None and drained[0] > 0:
+            used = yield from self._stream_events(
+                assembler, t_sent, deadline, first_token_deadline, base_agent, stop_event,
+                expect_tools, on_final_text, on_timing, on_thread)
+            if used:
+                return
+            if on_timing:
+                on_timing("event_fallback", 1)
+        emitted = ""
+        last = None
+        last_snapshot = ""
+        stable_since = None
+        stop_prev = False
         got_first = False
 
+        def finish():
+            text = last_snapshot
+            try:
+                fresh = self.chat_snapshot(base_agent)
+            except Exception:  # noqa: BLE001
+                fresh = ""
+            if fresh:
+                text = fresh
+            if on_final_text is not None and text:
+                try:
+                    on_final_text(text)
+                except Exception:  # noqa: BLE001
+                    log.warning("on_final_text 回调失败", exc_info=True)
+            self._report_thread(on_thread)
+
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
-        while time.time() < first_token_deadline:
+        while time.monotonic() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
-            if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
+            # 只认新的助手气泡。旧气泡在等待期间也可能重渲染，文本相等性
+            # 不可靠；气泡计数才是基线。
+            if not cur or cnt <= base_agent:
+                if time.monotonic() - t_sent > 14.0:
                     try:
                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
                     except Exception:
                         tail = ""
                     if "Still sending" in tail or "Connecting..." in tail:
                         raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+                stop_prev = has_stop
                 continue
 
-            delta = cur[len(sent):] if cur.startswith(sent) else cur
+            delta, emitted = self._stream_delta(emitted, cur)
+            last = cur
             if delta:
-                sent = cur
-                yield delta
-                last = cur
+                last_snapshot = cur
                 got_first = True
+                stop_prev = has_stop
+                if on_timing:
+                    on_timing("muse_first_delta_ms", round((time.monotonic() - t_sent) * 1000))
+                yield delta
                 break
+            stop_prev = has_stop
 
         if not got_first:
             raise MuseGenerationError("等待助手首字响应超时")
 
         # 2. 持续捕获增量文本
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
@@ -1548,22 +1773,127 @@ class MuseEngine:
             if not cur:
                 continue
 
+            now = time.monotonic()
             if cur != last:
-                delta = cur[len(sent):] if cur.startswith(sent) else cur
+                delta, emitted = self._stream_delta(emitted, cur)
+                last = cur
+                last_snapshot = cur
+                stable_since = None
+                stop_prev = has_stop
                 if delta:
-                    sent = cur
                     yield delta
-                last, stable = cur, 0
+                continue
+
+            if has_stop:
+                # Stop 仍在 = 仍在生成。静默不是完成信号，也不能让计时窗口
+                # 提前跑完；保持未计时，等 Stop 消失后再重新开始。
+                stable_since = None
+            elif stop_prev:
+                stable_since = now
             else:
-                stable += 1
-                # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
-                if not has_stop and stable >= 3:
+                stable_since = stable_since or now
+                quiet = 4.0 if expect_tools else 0.18
+                if now - stable_since >= quiet:
+                    finish()
                     return
-                # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if has_stop and stable >= 80:
-                    return
+            stop_prev = has_stop
 
         raise MuseGenerationError("等待助手回复超时")
+
+    def _report_thread(self, on_thread) -> None:
+        if on_thread is None:
+            return
+        try:
+            path = self.page.js("location.pathname") or ""
+            match = re.fullmatch(r"/thread/([0-9a-fA-F-]{36})/?", path)
+            on_thread(match.group(1) if match else None)
+        except Exception:  # noqa: BLE001
+            on_thread(None)
+
+    def _drain_events(self) -> tuple[int, list[dict]] | None:
+        try:
+            return muse_events.parse_drain(self.page.js(muse_events.DRAIN_JS))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _stream_events(self, assembler, t_sent, deadline, first_token_deadline, base_agent,
+                       stop_event, expect_tools, on_final_text, on_timing, on_thread):
+        """事件流主路径（CHATSRC）：输出 Markdown 增量。返回 False 表示应退回 DOM 读取。
+
+        只有还没输出任何内容时才能退回 DOM；一旦输出过，就在回复结束后用 message_done 或
+        DOM 最终内容补齐后缀，不混用两条路径的增量。
+        """
+        # 订阅存在但收不到本次 message_start（订阅失效、事件名改变）时，几秒后退回 DOM。
+        start_deadline = min(first_token_deadline, t_sent + 8.0)
+        dom_seen_at = None
+        first_sent = False
+        quiet = 4.0 if expect_tools else 0.18
+        stable_since = None
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return True
+            now = time.monotonic()
+            if now >= deadline:
+                raise MuseGenerationError("等待助手回复超时")
+            time.sleep(0.05)
+            drained = self._drain_events()
+            if drained is None and not assembler.emitted:
+                return False  # 页面重载丢了订阅脚本，且还没输出：交给 DOM
+            for record in (drained[1] if drained else []):
+                assembler.feed(record)
+            if assembler.error:
+                raise MuseGenerationError(f"Muse 生成失败：{assembler.error}")
+            if not assembler.started:
+                if time.monotonic() >= start_deadline:
+                    cnt, cur, _ = self._poll_chat()
+                    if cnt > base_agent and cur:
+                        return False  # DOM 已有新回复但事件没来：订阅不可用
+                    if time.monotonic() >= first_token_deadline:
+                        raise MuseGenerationError("等待助手首字响应超时")
+                continue
+            delta = assembler.take()
+            if delta:
+                if on_timing and not first_sent:
+                    on_timing("muse_first_delta_ms", round((time.monotonic() - t_sent) * 1000))
+                    on_timing("source_events", 1)
+                first_sent = True
+                yield delta
+            # 一轮回复可能由多条消息组成（先文字、再工具调用）。已知消息都完成不代表本轮结束：
+            # 还要等 Stop 消失并静默一段时间，期间出现新的 message_start 就继续收（CHATSRC-B08）。
+            try:
+                stopping = bool(self.page.js(muse_events.STOP_VISIBLE_JS))
+            except Exception:  # noqa: BLE001
+                stopping = True
+            if stopping:
+                stable_since = None
+                continue
+            stable_since = stable_since or time.monotonic()
+            if assembler.all_done:
+                if time.monotonic() - stable_since >= max(quiet, 1.0):
+                    break
+            elif time.monotonic() - stable_since >= max(quiet, 3.0):
+                # 事件中途断了：Stop 消失并静默一段时间后，按回复结束处理（CHATSRC-B03）。
+                dom_seen_at = time.monotonic()
+                break
+        if dom_seen_at is None:
+            tail = assembler.take(final=True)
+        else:
+            # 没收到 message_done：用 DOM 最终内容补齐，只在它以已发内容为前缀时补发。
+            dom = self.chat_snapshot(base_agent)
+            tail = dom[len(assembler.emitted):] if dom.startswith(assembler.emitted) else ""
+            assembler.emitted += tail
+        if tail:
+            yield tail
+        text = assembler.final_text() if dom_seen_at is None else assembler.emitted
+        if not text.strip():
+            raise MuseGenerationError("Muse 回复为空（生成被中断）")
+        if on_final_text is not None:
+            try:
+                on_final_text(text)
+            except Exception:  # noqa: BLE001
+                log.warning("on_final_text 回调失败", exc_info=True)
+        self._report_thread(on_thread)
+        return True
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None) -> str:

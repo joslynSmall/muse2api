@@ -1,0 +1,121 @@
+{
+  "flows": {
+    "CHATSESS": {
+      "files": {
+        "app.py": {
+          "branches": [
+            "CHATSESS-B01",
+            "CHATSESS-B02",
+            "CHATSESS-B03",
+            "CHATSESS-B05",
+            "CHATSESS-B07",
+            "CHATSESS-B08",
+            "CHATSESS-B09",
+            "CHATSESS-B10",
+            "CHATSESS-B11",
+            "CHATSESS-B12"
+          ],
+          "hash": "420172a66b67a46c97daeea50456b78ffc966366"
+        },
+        "chat_sessions.py": {
+          "branches": [
+            "CHATSESS-B01",
+            "CHATSESS-B02",
+            "CHATSESS-B03",
+            "CHATSESS-B04",
+            "CHATSESS-B06",
+            "CHATSESS-B08",
+            "CHATSESS-B12"
+          ],
+          "hash": "d9a74a676994a4e6cf1b2a787ddf6714dcdca2c4"
+        },
+        "chat_transport.py": {
+          "branches": [
+            "CHATSESS-B12"
+          ],
+          "hash": "1614815cb33dee33bef8d3a4154a53ce27acfa16"
+        },
+        "engine.py": {
+          "branches": [
+            "CHATSESS-B02",
+            "CHATSESS-B05"
+          ],
+          "hash": "d40e1f674ddb81d37af187d1fad91bec13c94614"
+        },
+        "tests/test_chat_cancel.py": {
+          "branches": [
+            "CHATSESS-B12"
+          ],
+          "hash": "c9a5b5a67879e15a6ea7f399ab3d8c82a2d72f9c"
+        },
+        "tests/test_chat_session_endpoints.py": {
+          "branches": [
+            "CHATSESS-B05",
+            "CHATSESS-B09",
+            "CHATSESS-B11"
+          ],
+          "hash": "0f4cef801209686f657c24b10df49b356623eea1"
+        },
+        "tests/test_chat_sessions.py": {
+          "branches": [
+            "CHATSESS-B01",
+            "CHATSESS-B02",
+            "CHATSESS-B03",
+            "CHATSESS-B04",
+            "CHATSESS-B06",
+            "CHATSESS-B07",
+            "CHATSESS-B08"
+          ],
+          "hash": "a0563e4db67c91f7dcd6b2341ebac345b8b6a862"
+        },
+        "tests/test_safe_chat_stream_session.py": {
+          "branches": [
+            "CHATSESS-B10"
+          ],
+          "hash": "f8578237fdcf7c018fee69d97065e360585584b5"
+        }
+      },
+      "flowHash": "bc9b8a5dfd29dc265bbb2c2a756a52a8deb9b5a3",
+      "verifiedAt": "2026-11-12"
+    },
+    "CHATSRC": {
+      "files": {
+        "engine.py": {
+          "branches": [
+            "CHATSRC-B01",
+            "CHATSRC-B02",
+            "CHATSRC-B03",
+            "CHATSRC-B04",
+            "CHATSRC-B07"
+          ],
+          "hash": "d40e1f674ddb81d37af187d1fad91bec13c94614"
+        },
+        "muse_events.py": {
+          "branches": [
+            "CHATSRC-B01",
+            "CHATSRC-B03",
+            "CHATSRC-B04",
+            "CHATSRC-B05",
+            "CHATSRC-B06"
+          ],
+          "hash": "0278f433089b5d2700d944f3dc392bc7c1e549b9"
+        },
+        "tests/test_chat_events.py": {
+          "branches": [
+            "CHATSRC-B01",
+            "CHATSRC-B02",
+            "CHATSRC-B03",
+            "CHATSRC-B04",
+            "CHATSRC-B05",
+            "CHATSRC-B06",
+            "CHATSRC-B07"
+          ],
+          "hash": "67b82c60deb169558ec03a6aa6b1c1f85db64ddb"
+        }
+      },
+      "flowHash": "650dc37a11bf5660d969fa067d4bbd53b28d788b",
+      "verifiedAt": "2026-11-12"
+    }
+  },
+  "version": 1
+}
