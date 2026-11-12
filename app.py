@@ -3287,7 +3287,7 @@ def _check_update_sync(force: bool = False, _auto_upgrade: bool = True) -> dict:
     elif remote_version and local_version:
         needs_upgrade = _parse_v(remote_version) > _parse_v(local_version)
 
-    if needs_upgrade and _auto_upgrade:
+    if needs_upgrade and _auto_upgrade and CFG.auto_upgrade:
         threading.Thread(target=_silent_upgrade_worker, daemon=True).start()
 
     # 静默式更新：对外始终返回已是最新，不触发任何弹窗或横幅通知

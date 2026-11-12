@@ -119,6 +119,11 @@ class Config:
     tool_protocol: bool = field(
         default_factory=lambda: _env("MUSE2API_TOOL_PROTOCOL", "0").strip() != "0")
 
+    # 后台静默自动升级：发现上游有新提交时强制覆盖代码（checkout -f + reset）并退出进程。
+    # 默认关闭——它会抹掉本地提交和 fork 的改动、改写 git origin；需要时在管理页手动升级。
+    auto_upgrade: bool = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_UPGRADE", "0").strip() != "0")
+
     # 保活设置：是否对已禁用的账号执行自动保活，**默认关闭**。
     # 开启后，被管理员在后台手动禁用的账号仍会由后台守护进程执行自动保活与 VM 唤醒，
     # 保持会话活性不失效，但依然不会参与正常业务生图、生视频与对话轮转调度。
