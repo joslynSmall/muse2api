@@ -223,4 +223,47 @@ with tempfile.TemporaryDirectory() as home:
                    {"role": "user", "content": "after"}], [bash, read], "claude-session-tools")
         assert calls[-1]["thread"] is None and "LONG-READ-DOC" in calls[-1]["prompt"]
 
-    print("PASS: CHATSESS endpoints bind, continue, rebind, fail closed, isolate agents")
+    # CHATSESS-B16：模型调用客户端没有的工具 → 同一 thread 追发纠正，拿到真实工具调用。
+    replies = []
+    seen = []
+
+    def scripted(cookies, prompt, expires, timeout, account_id=None, **kw):
+        seen.append({"prompt": prompt, "thread": kw.get("thread_id")})
+        text = replies.pop(0)
+        if kw.get("on_thread"):
+            kw["on_thread"](kw.get("thread_id") or THREAD_A)
+        if kw.get("on_final_text"):
+            kw["on_final_text"](text)
+        yield text
+
+    bash = {"type": "function", "function": {
+        "name": "Bash", "description": "run", "parameters": {
+            "type": "object", "properties": {"command": {"type": "string"}},
+            "required": ["command"]}}}
+    search = {"type": "function", "function": {"name": "ToolSearch", "parameters": {
+        "type": "object", "properties": {"query": {"type": "string"}}}}}
+    bogus = ('我用这边的浏览器。\n\n```tool_call\n{"name": "browser.browse", '
+             '"arguments": {"task": "x"}}\n```')
+    good = '```tool_call\n{"name": "Bash", "arguments": {"command": "ls"}}\n```'
+
+    def tool_chat(sid, stateless=False):
+        body = {"model": "muse-spark", "stream": True, "tools": [bash, search],
+                "messages": [{"role": "user", "content": "open the site"}]}
+        hdr = {} if stateless else {"X-Claude-Code-Session-Id": sid}
+        return asyncio.run(asgi(app.app, "/v1/chat/completions", body, hdr))
+
+    with patch.object(app, "safe_chat_stream", side_effect=scripted), \
+         patch.object(app, "_pace_text", side_effect=lambda t, *a, **k: iter([t] if t else [])):
+        replies[:] = [bogus, good]
+        status, body = tool_chat("claude-session-unknown-tool")
+        assert status == 200 and '"finish_reason": "tool_calls"' in body, body
+        assert '"name": "Bash"' in body and "browser.browse" not in body, body
+        assert len(seen) == 2 and seen[1]["thread"] == THREAD_A, seen
+        assert "browser.browse" in seen[1]["prompt"] and "ToolSearch" in seen[1]["prompt"]
+        # 无会话（无法在同一 thread 纠正）：不重试，也不把执行不了的调用当正文发出。
+        seen.clear()
+        replies[:] = [bogus]
+        status, body = tool_chat("", stateless=True)
+        assert len(seen) == 1 and "browser.browse" not in body and '"finish_reason": "stop"' in body
+
+    print("PASS: CHATSESS endpoints bind, continue, rebind, fail closed, isolate agents, B16 correction")

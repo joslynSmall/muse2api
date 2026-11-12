@@ -75,6 +75,10 @@ sequenceDiagram
         A-->>C: 错误，不发送成功结束事件
     else CHATSESS-B13 续轮工具清单与上次相同
         A->>E: 只附简短提醒（工具名 + 参数名），不重发完整清单
+    else CHATSESS-B16 模型调用了客户端没有的工具
+        W-->>E: tool_call 名不在白名单（如 browser.browse、muse.*）
+        A->>E: 同一 thread 追发一次纠正提示（含 ToolSearch 用法）
+        E-->>A: 纠正后的回复，按 B06 交付工具调用；无会话时不重试、不把该调用当正文
     else CHATSESS-B14 续轮复用上一轮的热页面
         A->>E: 同会话、同账号、同 thread、同代理快照的热页面
         E->>W: 校验仍在 /thread/<uuid> 且输入框就绪后直接发送
@@ -106,6 +110,7 @@ sequenceDiagram
 | CHATSESS-B13 | 续轮工具清单不变只发简短提醒 | done | app.py:1122; tool_protocol.py:247; chat_sessions.py:152 | tests/test_chat_session_endpoints.py::CHATSESS-B13 | 续轮提示词从约 7 万字降到约 1 千字 | 只在 continue 且清单指纹等于该 thread 上次成功发送的指纹时用提醒；新建、重绑、清单变化时发完整清单；失败轮次不更新指纹 | model:同一 thread 前文已有完整定义，重复发送只增加噪声和延迟 |
 | CHATSESS-B14 | 续轮复用上一轮的热页面 | done | app.py:430; engine.py:833; engine.py:866 | tests/test_chat_page_reuse.py::CHATSESS_B14 | 跳过 40–80 秒的页面加载（实测 65 s → 5 ms） | 只在 continue 且账号、thread、代理快照全部一致时复用；复用前校验 URL 仍为该 thread、输入框就绪；不满足即关闭并冷启动 | user |
 | CHATSESS-B15 | 热页面回收 | done | engine.py:893; app.py:3509; app.py:230 | tests/test_chat_page_reuse.py::CHATSESS_B15 | 页面与 BrowserContext 释放 | 失败 / 取消 / 绑定未写入的轮次不保留页面；空闲超时关闭；同账号被其他会话或维护操作使用前关闭；每个账号最多一个热页面 | model:与原每轮关页的隔离语义一致，只在明确匹配时延长生命周期 |
+| CHATSESS-B16 | 模型调用客户端没有的工具时纠正一次 | done | app.py:1186; app.py:1140; tool_protocol.py:414; tool_protocol.py:248 | tests/test_chat_session_endpoints.py::CHATSESS-B16 | 客户端拿到白名单内的工具调用，或正文 | 执行不了的调用不进正文、不进 tool_calls；纠正只在绑定会话、同一 thread 内重试一次；续轮提醒保留延迟加载说明 | model:真实会话中续轮提醒丢了延迟加载说明，模型改调 browser.browse，客户端收到的是无法执行的正文 |
 | CHATSESS-B08 | 同会话并发拒绝 | done | chat_sessions.py:97; app.py:1013 | tests/test_chat_sessions.py::CHATSESS_B08 | 409 | 同一 key 同时只有一个请求；ttl=timeout+60 兜底 | model:并发写同一 thread 会让增量错位 |
 
 ## 关联流程（边界分支）
@@ -121,6 +126,7 @@ sequenceDiagram
 
 | 日期 | 任务 | 变更的分支 ID |
 |---|---|---|
+| 2026-11-12 | 修复：续轮提醒丢失延迟加载说明；未知工具调用在同一 thread 纠正一次 | CHATSESS-B13、CHATSESS-B16 |
 | 2026-11-12 | 实现热页面复用与回收；真实 claude 三轮工具调用验证续轮首字 2–8 秒 | CHATSESS-B14、CHATSESS-B15 |
 | 2026-11-12 | 登记热页面复用与回收 | CHATSESS-B14、CHATSESS-B15 |
 | 2026-11-12 | 精简工具提示词：紧凑 Schema、续轮简短提醒 | CHATSESS-B13 |

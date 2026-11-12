@@ -10,7 +10,7 @@
             "CHATMSG-B06",
             "CHATMSG-B09"
           ],
-          "hash": "77564ae59ff8b801a343367f844967ef6422a436"
+          "hash": "eac39a45305f5663e6a0753f44ad993e51997f84"
         },
         "chat_transport.py": {
           "branches": [
@@ -36,7 +36,7 @@
           "branches": [
             "CHATMSG-B06"
           ],
-          "hash": "2da0501501afb0a512d12c6ed8d866bd6e1814d2"
+          "hash": "04ea77b416d51b6f326eaf38a5e6e252356e5629"
         },
         "tests/test_chat_transport.py": {
           "branches": [
@@ -62,7 +62,7 @@
           "branches": [
             "CHATMSG-B04"
           ],
-          "hash": "87a038fc0ca8610d26372a7240a4cadc4ae84f35"
+          "hash": "33a52cfdb4dec53caecc1d71852f0ee78c55ab33"
         }
       },
       "flowHash": "0b0d912592148712134de89c790ae9938d10daa3",
@@ -76,7 +76,7 @@
             "CHATPRUN-B05",
             "CHATPRUN-B06"
           ],
-          "hash": "77564ae59ff8b801a343367f844967ef6422a436"
+          "hash": "eac39a45305f5663e6a0753f44ad993e51997f84"
         },
         "engine.py": {
           "branches": [],
@@ -122,9 +122,10 @@
             "CHATSESS-B12",
             "CHATSESS-B13",
             "CHATSESS-B14",
-            "CHATSESS-B15"
+            "CHATSESS-B15",
+            "CHATSESS-B16"
           ],
-          "hash": "77564ae59ff8b801a343367f844967ef6422a436"
+          "hash": "eac39a45305f5663e6a0753f44ad993e51997f84"
         },
         "chat_sessions.py": {
           "branches": [
@@ -172,9 +173,10 @@
             "CHATSESS-B05",
             "CHATSESS-B09",
             "CHATSESS-B11",
-            "CHATSESS-B13"
+            "CHATSESS-B13",
+            "CHATSESS-B16"
           ],
-          "hash": "2da0501501afb0a512d12c6ed8d866bd6e1814d2"
+          "hash": "04ea77b416d51b6f326eaf38a5e6e252356e5629"
         },
         "tests/test_chat_sessions.py": {
           "branches": [
@@ -196,12 +198,13 @@
         },
         "tool_protocol.py": {
           "branches": [
-            "CHATSESS-B13"
+            "CHATSESS-B13",
+            "CHATSESS-B16"
           ],
-          "hash": "87a038fc0ca8610d26372a7240a4cadc4ae84f35"
+          "hash": "33a52cfdb4dec53caecc1d71852f0ee78c55ab33"
         }
       },
-      "flowHash": "96367dacba8e5d37ea5ecb4d03dd12b32aa24d11",
+      "flowHash": "d4790883d6229866919436f9045f3d528721d2f3",
       "verifiedAt": "2026-11-12"
     },
     "CHATSRC": {

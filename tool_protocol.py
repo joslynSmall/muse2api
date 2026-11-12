@@ -19,7 +19,8 @@ import json
 import re
 import uuid
 
-__all__ = ["build_tools_prompt", "build_tools_reminder", "parse_tool_calls", "tool_choice_value"]
+__all__ = ["build_tools_prompt", "build_tools_reminder", "parse_tool_calls", "tool_choice_value",
+           "unknown_tool_names", "build_unknown_tool_correction"]
 
 
 _TOOL_PROTOCOL_HEAD = """【客户端工具说明】
@@ -29,7 +30,7 @@ _TOOL_PROTOCOL_HEAD = """【客户端工具说明】
 {"name": "工具名", "arguments": {参数}}
 ```
 - 每个代码块只放一个 JSON 对象；要多个工具就写多个代码块。
-- name 必须是下面清单里的名字；arguments 必须是合法 JSON 对象。
+- name 必须是下面清单里的名字；arguments 必须是合法 JSON 对象。你自带的工具（如 browser.*、muse.*、搜索、画图）客户端执行不了，不要调用。
 - 不要用 json 代码块表示调用，也不要编造执行结果、退出码或主机名——命令还没跑过。
 - 不需要工具时，直接用自然语言回答。
 
@@ -37,7 +38,7 @@ _TOOL_PROTOCOL_HEAD = """【客户端工具说明】
 """
 
 _TOOL_REMINDER_HEAD = """【客户端工具说明（沿用前文）】
-工具清单和参数与前文相同。用户电脑上的操作只能通过客户端工具完成；需要时只输出 ```tool_call 代码块（块内一个 JSON：{"name": "工具名", "arguments": {参数}}），然后结束回复等待结果。不要编造执行结果；不需要工具时直接回答。
+工具清单和参数与前文相同。用户电脑上的操作只能通过下面的客户端工具完成；需要时只输出 ```tool_call 代码块（块内一个 JSON：{"name": "工具名", "arguments": {参数}}），然后结束回复等待结果。你自带的工具（如 browser.*、muse.*）客户端执行不了，不要调用。不要编造执行结果；不需要工具时直接回答。
 """
 
 # 只有工具清单里有 ToolSearch 时才追加：客户端把 MCP 等工具设为延迟加载，
@@ -264,8 +265,11 @@ def build_tools_reminder(tools, tool_choice=None) -> str:
         # 参数名（* 为必填）留作提示：长对话里模型最容易记错的正是参数名。
         args = ", ".join(k + ("*" if k in required else "") for k in props)
         lines.append("- %s(%s)" % (tool["name"], args))
+    # 延迟加载说明必须保留：MCP 工具名只在系统提示里，模型忘了这条就会说"没有这个工具"
+    # 或去调用网页自带的工具（CHATSESS-B16）。
+    deferred = _DEFERRED_TOOLS_NOTE if any(t["name"] == "ToolSearch" for t in normalized) else ""
     return (_TOOL_REMINDER_HEAD + _choice_note(pick)
-            + "可用工具（* 为必填参数，完整定义见前文）：\n" + "\n".join(lines) + "\n")
+            + "可用工具（* 为必填参数，完整定义见前文）：\n" + "\n".join(lines) + "\n" + deferred)
 
 
 def _canonical_arguments(value):
@@ -405,6 +409,54 @@ def _whole_text_call(text: str, names: set[str], decoder: json.JSONDecoder):
         return None
     found = _as_tool_calls(obj, names)
     return (found, "") if found else (None, text)
+
+
+def unknown_tool_names(text: str, tools=None) -> list[str]:
+    """回复里 tool_call 标记后的调用名不在白名单时返回这些名字（CHATSESS-B16）。
+
+    例如模型调用了网页自带的 browser.browse、muse.*：客户端执行不了，又不是正文。
+    """
+    if not isinstance(text, str) or "tool_call" not in text.lower():
+        return []
+    allowed = {tool["name"] for tool in _normalize_tools(tools)}
+    decoder = json.JSONDecoder()
+    found: list[str] = []
+    for match in _INLINE_RE.finditer(text):
+        start = _json_start(text, match.end())
+        if start is None:
+            # ```tool_call 代码块：JSON 在下一行
+            nl = text.find("\n", match.end())
+            start = _json_start(text, nl) if nl >= 0 else None
+        if start is None:
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        for item in obj if isinstance(obj, list) else [obj]:
+            if not isinstance(item, dict):
+                continue
+            fn = item.get("function")
+            name = item.get("name") or item.get("tool") or (
+                fn.get("name") if isinstance(fn, dict) else fn)
+            if isinstance(name, str) and name.strip() and name.strip() not in allowed \
+                    and name.strip() not in found:
+                found.append(name.strip())
+    return found
+
+
+def build_unknown_tool_correction(names: list[str], tools=None) -> str:
+    """模型调用了客户端没有的工具时，在同一 thread 里追发的纠正提示。"""
+    has_search = any(t["name"] == "ToolSearch" for t in _normalize_tools(tools))
+    lines = [
+        "【客户端提示】你刚才调用的 %s 不是客户端工具，客户端无法执行，上一条回复作废。"
+        % "、".join(names),
+        "请只用前文客户端工具清单里的工具重新完成用户的请求，按 ```tool_call 格式输出，然后结束回复。",
+    ]
+    if has_search:
+        lines.append('需要 mcp__ 开头的 MCP 工具时，先调用 ToolSearch，参数 '
+                     '{"query": "select:工具全名", "max_results": 5}。')
+    return "\n".join(lines)
 
 
 def _add_calls(calls: list[dict], found: list[dict]) -> None:

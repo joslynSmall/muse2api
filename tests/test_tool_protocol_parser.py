@@ -355,5 +355,22 @@ def main():
     print("PASS: %d tool protocol parser tests" % len(tests))
 
 
+def test_CHATSESS_B16_reminder_keeps_deferred_note_and_detects_unknown_tools():
+    with_search = TOOLS + [{"name": "ToolSearch", "input_schema": {
+        "type": "object", "properties": {"query": {"type": "string"}}}}]
+    reminder = tp.build_tools_reminder(with_search)
+    assert "延迟加载" in reminder and "ToolSearch" in reminder, reminder
+    assert "延迟加载" not in tp.build_tools_reminder(TOOLS)
+    assert "browser" in reminder and "browser" in tp.build_tools_prompt(with_search)
+    text = ('说明\n\n```tool_call\n{"name": "browser.browse", "arguments": {}}\n```\n\n'
+            'tool_call\n{"name": "muse.react", "arguments": {}}\n\n'
+            '```tool_call\n{"name": "Bash", "arguments": {"command": "ls"}}\n```')
+    assert tp.unknown_tool_names(text, with_search) == ["browser.browse", "muse.react"]
+    assert tp.unknown_tool_names("没有调用，只是提到 tool_call 这个词", with_search) == []
+    assert tp.unknown_tool_names('```tool_call\n{"name": "Bash", "arguments": {}}\n```', TOOLS) == []
+    note = tp.build_unknown_tool_correction(["browser.browse"], with_search)
+    assert "browser.browse" in note and "ToolSearch" in note
+
+
 if __name__ == "__main__":
     main()
