@@ -1845,6 +1845,33 @@ def _chat_chunk(cid: str, created: int, model: str, delta: dict,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
 
+# Muse 网页不返回真实 token 用量；以下按字符估算，仅供客户端显示上下文进度。
+_CJK_RANGES = (
+    (0x1100, 0x11FF), (0x2E80, 0x2FFF), (0x3000, 0x303F),
+    (0x3040, 0x30FF), (0x3130, 0x318F), (0x31C0, 0x31EF),
+    (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF),
+    (0xF900, 0xFAFF), (0xFF00, 0xFFEF), (0x20000, 0x2FA1F),
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """估算 token 数：CJK 每字 1，其余每 4 字符 1（向上取整）；Muse 无真实计数。"""
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES))
+    return cjk + (len(text) - cjk + 3) // 4
+
+
+def _output_tokens(text: str, calls: list[dict] | None) -> int:
+    """输出侧估算：正文 + 每个工具调用的 name 与 arguments。"""
+    parts = [text or ""]
+    for call in calls or []:
+        function = call.get("function") or {}
+        parts.append(str(function.get("name") or ""))
+        parts.append(str(function.get("arguments") or ""))
+    return estimate_tokens("\n".join(parts))
+
+
 def _want_usage(stream_options) -> bool:
     """下游（LangChain、部分 SDK / 智能体框架）会带
     `stream_options.include_usage=true`，要求在 [DONE] 之前补一个
@@ -1929,12 +1956,15 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
     if req.stream:
         def sync_stream():
             try:
+                completion_text = ""
+                calls = None
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
                 if not tool_note:
                     for chunk in safe_chat_stream(cookies, prompt, expires, timeout,
                                                   account_id=acc_id, **extra):
+                        completion_text += chunk
                         for piece in _pace_text(chunk):
                             yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
                     turn.commit()
@@ -1949,6 +1979,7 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
                             chunks, req.tools, result,
                             turn.retry_factory(cookies, expires, timeout, acc_id),
                             turn.has_tool_results):
+                        completion_text += text
                         for piece in _pace_text(text):
                             yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
                     calls = result.get("calls")
@@ -1960,10 +1991,14 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
                     else:
                         yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
                 if _want_usage(req.stream_options):
+                    prompt_tokens = estimate_tokens(prompt)
+                    completion_tokens = _output_tokens(completion_text, calls)
                     yield _sse({"id": cid, "object": "chat.completion.chunk",
                                 "created": created, "model": model,
                                 "choices": [],
-                                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+                                "usage": {"prompt_tokens": prompt_tokens,
+                                          "completion_tokens": completion_tokens,
+                                          "total_tokens": prompt_tokens + completion_tokens}})
                 yield "data: [DONE]\n\n"
                 store.mark(acc_id, True, "")
             except MuseAuthError as exc:
@@ -2004,7 +2039,10 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
     finally:
         turn.close()
 
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    prompt_tokens = estimate_tokens(prompt)
+    completion_tokens = _output_tokens(text, calls)
+    usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+             "total_tokens": prompt_tokens + completion_tokens}
     if calls:
         return {"id": cid, "object": "chat.completion", "created": created,
                 "model": model,
@@ -2150,12 +2188,14 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
 
     def envelope(status: str, text: str = "", calls: list[dict] | None = None) -> dict:
+        input_tokens = estimate_tokens(prompt)
+        output_tokens = _output_tokens(text, calls) if status == "completed" else 0
         return {"id": rid, "object": "response", "created_at": created,
                 "status": status, "model": model,
                 "output": (_response_output(mid, text, calls)
                            if status == "completed" else []),
-                "usage": {"input_tokens": 0, "output_tokens": 0,
-                          "total_tokens": 0}}
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                          "total_tokens": input_tokens + output_tokens}}
 
     if req.stream:
         def sync_stream_live():
@@ -2310,7 +2350,8 @@ def _messages_to_chat(req: MessagesRequest) -> list[ChatMessage]:
     return msgs
 
 
-def _message_body(mid: str, model: str, text: str, calls: list[dict] | None) -> dict:
+def _message_body(mid: str, model: str, text: str, calls: list[dict] | None,
+                  usage: dict | None = None) -> dict:
     """Anthropic Message：正文是 text 块，工具调用是 tool_use 块。"""
     content = []
     if text:
@@ -2326,7 +2367,7 @@ def _message_body(mid: str, model: str, text: str, calls: list[dict] | None) -> 
             "content": content,
             "stop_reason": "tool_use" if calls else "end_turn",
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0}}
+            "usage": usage or {"input_tokens": 0, "output_tokens": 0}}
 
 
 def _message_text_deltas(index: int, text: str):
@@ -2390,6 +2431,13 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
         raise HTTPException(400, "messages 为空")
     prompt = turn.with_tools(prompt, req.tools, req.tool_choice)
 
+    # 按客户端完整对话估算，使续轮时客户端上下文进度不回落；
+    # 实际发给 Muse 的可能只是增量。
+    full_prompt = _messages_prompt(incoming)
+    tools_note = build_tools_prompt(req.tools, req.tool_choice) if CFG.tool_protocol else ""
+    input_tokens = estimate_tokens(
+        full_prompt + ("\n\n" + tools_note if tools_note else ""))
+
     mid = "msg_" + uuid.uuid4().hex[:24]
     acc = turn.account
     acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
@@ -2398,12 +2446,15 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
     if req.stream:
         def sync_stream():
             try:
-                opening = _message_body(mid, model, "", None)
+                opening = _message_body(
+                    mid, model, "", None,
+                    usage={"input_tokens": input_tokens, "output_tokens": 1})
                 opening["content"] = []
                 opening["stop_reason"] = None
                 yield _sse_event("message_start", {
                     "type": "message_start", "message": opening})
                 calls = None
+                output_parts: list[str] = []
                 if has_tools:
                     result: dict = {}
                     chunks = lambda on_final: safe_chat_stream(  # noqa: E731
@@ -2419,6 +2470,7 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
                                 "type": "content_block_start", "index": 0,
                                 "content_block": {"type": "text", "text": ""}})
                             text_started = True
+                        output_parts.append(text)
                         yield from _message_text_deltas(0, text)
                     calls = result.get("calls")
                     if text_started:
@@ -2432,6 +2484,7 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
                         "content_block": {"type": "text", "text": ""}})
                     for chunk in safe_chat_stream(
                             cookies, prompt, expires, timeout, account_id=acc_id, **extra):
+                        output_parts.append(chunk)
                         yield from _message_text_deltas(0, chunk)
                     yield _sse_event("content_block_stop", {
                         "type": "content_block_stop", "index": 0})
@@ -2440,7 +2493,8 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
                     "type": "message_delta",
                     "delta": {"stop_reason": "tool_use" if calls else "end_turn",
                               "stop_sequence": None},
-                    "usage": {"output_tokens": 0}})
+                    "usage": {"input_tokens": input_tokens,
+                              "output_tokens": _output_tokens("".join(output_parts), calls)}})
                 yield _sse_event("message_stop", {"type": "message_stop"})
                 store.mark(acc_id, True, "")
             except Exception as exc:  # noqa: BLE001
@@ -2473,7 +2527,9 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
     finally:
         turn.close()
     store.mark(acc_id, True, "")
-    return _message_body(mid, model, text, calls)
+    return _message_body(mid, model, text, calls, usage={
+        "input_tokens": input_tokens,
+        "output_tokens": _output_tokens(text, calls)})
 
 
 @app.get("/v1/media/{name}")

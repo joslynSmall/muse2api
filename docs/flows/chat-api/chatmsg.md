@@ -9,7 +9,7 @@ upstream: [CHATSRC]
 downstream: []
 related: [CHATSESS]
 external: []
-last_verified: 2026-11-12
+last_verified: 2026-11-13
 ---
 
 # Claude Messages 网页对话回传（CHATMSG）
@@ -71,6 +71,7 @@ sequenceDiagram
         A->>E: cancelled 信号
         Note over A,E: 停止发送；工作线程负责释放资源
     end
+    Note over A,C: CHATMSG-B14 usage 估算：Messages input 按客户端完整对话，Chat Completions/Responses 按发给 Muse 的 prompt；output 按正文+工具参数
     Note over A,W: 带会话 Header 时由 CHATSESS 绑定同一 Muse thread
 ```
 
@@ -91,6 +92,7 @@ sequenceDiagram
 | CHATMSG-B12 | 无法执行的工具调用：纠正一次或可见说明 | done | tool_protocol.py:539; app.py:1186; app.py:1238 | tests/test_chat_session_endpoints.py::CHATMSG-B12 | 合法 tool_calls，或正文 + 说明 + stop | 无法执行的调用不进 tool_calls、不原样进正文；纠正只在绑定会话同一 thread 内一次；流式与非流式同一规则 | model:原行为把坏调用原样当正文交给客户端，用户看到一段未执行的 tool_call |
 | CHATMSG-B13 | 无工具调用却声称已执行（编造结果） | done | tool_protocol.py:577; app.py:1141; app.py:1191 | tests/test_chat_session_endpoints.py::CHATMSG-B13 | 纠正后的 tool_calls，或正文 + 说明 | 只在本轮输入不含工具结果、且无任何工具调用时检查；需同时出现完成态说法与执行对象；带工具结果的总结不算 | model:真实回复"已生成并执行，cat fmt.txt 的真实内容是…"而文件不存在 |
 | CHATMSG-B09 | Chat Completions 带工具时正文边生成边发 | done | app.py:1169; app.py:1839 | tests/test_stream_tool_calls.py::CHATMSG-B09 | finish=tool_calls 或 stop | 正文增量拼接 + 补发余量 = 解析后的正文；tool_call 标记及 JSON 不进 content；已发正文不重放 | user |
+| CHATMSG-B14 | usage 估算 | done | app.py:1857; app.py:2438 | tests/test_usage_estimate.py::CHATMSG_B14 | 响应携带估算 usage | Muse 无真实计数，usage 为字符估算：CJK 1字≈1，其余4字符≈1；Messages 的 input 基于客户端完整对话（system+messages+完整工具清单），续轮不回落；Chat Completions/Responses 的 input 基于发给 Muse 的 prompt；output 基于正文+工具调用参数 | user |
 
 ## 关联流程（边界分支）
 
@@ -107,6 +109,8 @@ sequenceDiagram
 
 | 日期 | 任务 | 变更的分支 ID |
 |---|---|---|
+| 2026-11-13 | usage 改为按字符估算，覆盖 Messages / Chat Completions / Responses | CHATMSG-B14 |
+| 2026-11-13 | Messages 的 input_tokens 按客户端完整对话估算，续轮不回落 | CHATMSG-B14 |
 | 2026-11-12 | 检测无工具调用却声称已执行，按 B12 纠正 | CHATMSG-B13 |
 | 2026-11-12 | 工具调用 JSON 补齐、参数校验、无法执行时纠正一次或可见说明 | CHATMSG-B10、CHATMSG-B11、CHATMSG-B12 |
 | 2026-11-12 | 核对代码与终态测试，确认 B04–B07 | CHATMSG-B04、CHATMSG-B05、CHATMSG-B06、CHATMSG-B07 |
