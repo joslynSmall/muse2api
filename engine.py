@@ -1669,12 +1669,10 @@ class MuseEngine:
         "var textOf=" + _CHAT_TEXT_FN_JS + ";"
         "var nonEmpty=bs.filter(function(b){return textOf(b).length>0;});"
         "var txt=nonEmpty.length?textOf(nonEmpty[nonEmpty.length-1]):'';"
-        "var stopEls=[].slice.call(document.querySelectorAll("
-        "'[data-testid=\"hatch-composer-stop-button\"],'"
-        "+'button[aria-label*=\"Stop\" i],button[aria-label*=\"停止\"]'));"
-        "var stop=stopEls.some(function(e){return e.getClientRects().length>0"
-        "&&getComputedStyle(e).visibility!=='hidden';});"
-        "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})()"
+        # Stop 可见性直接复用事件流同一视觉谓词；不要在这里恢复旧的
+        # getClientRects + visibility 判定，否则 DOM 兜底会在透明 Stop 下空转到超时。
+        "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,"
+        "stop:" + muse_events.STOP_VISIBLE_JS + "});})()"
     )
 
     def _agent_text(self) -> str:

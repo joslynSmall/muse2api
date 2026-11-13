@@ -9,7 +9,7 @@ upstream: []
 downstream: []
 related: [CHATMSG, CHATSRC, CHATPRUN]
 external: []
-last_verified: 2026-11-12
+last_verified: 2026-11-13
 ---
 
 # Claude 会话绑定 Muse thread（CHATSESS）

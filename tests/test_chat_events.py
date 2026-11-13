@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,39 @@ import muse_events  # noqa: E402
 from muse_events import ReplyAssembler  # noqa: E402
 
 MD = "# 标题\n\n- **列表**\n\n```python\nprint(1)\n```\n\n| a | b |\n|---|---|"
+
+
+# STOP_VISIBLE_JS 的 Python 等价判定；style 为元素的有效计算样式（visibility 已解析继承/覆盖）。
+class FakeElement(SimpleNamespace):
+    def __init__(self, parent=None, display="block", visibility="visible", opacity=1.0,
+                 attrs=None, aria_hidden=False, disabled=False, rects=1, width=10,
+                 connected=True):
+        super().__init__(parent=parent, attrs=attrs or {}, aria_hidden=aria_hidden,
+                         disabled=disabled, rects=rects, width=width, height=10,
+                         connected=connected, style=SimpleNamespace(
+                             display=display, visibility=visibility, opacity=float(opacity)))
+
+
+StopElementSource = list[FakeElement] | Callable[[float], list[FakeElement]]
+PollState = Callable[[float], tuple[int, str]]
+
+
+def stop_visible(elements: list[FakeElement]) -> bool:
+    def visible(el: FakeElement) -> bool:
+        if (not el.connected or el.rects <= 0 or min(el.width, el.height) <= 0
+                or el.style.display == "none"
+                or el.style.visibility in ("hidden", "collapse")):
+            return False
+        opacity, node = 1.0, el
+        while node:
+            if node.style.display == "none":
+                return False
+            opacity *= node.style.opacity
+            if opacity <= 0:
+                return False
+            node = node.parent
+        return True
+    return any(visible(el) for el in elements)
 
 
 def ev(name, mid, seq=None, **payload):
@@ -100,6 +134,7 @@ def drain_payload(subs, records):
 with tempfile.TemporaryDirectory() as home:
     os.environ.update(MUSE2API_HOME=home, MUSE2API_PROFILE_ROOT=home, MUSE2API_KEY="test-only")
     spec = importlib.util.spec_from_file_location("chat_events_engine", ROOT / "engine.py")
+    assert spec is not None and spec.loader is not None
     em = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = em
     spec.loader.exec_module(em)
@@ -127,9 +162,29 @@ with tempfile.TemporaryDirectory() as home:
     class FakePage:
         """模拟页面：事件队列按时间投放；DOM 只给出纯文本（无格式）。"""
 
-        def __init__(self, timeline, subs: int | None = 1, dom=None, stop_until=0.0):
+        def __init__(self, timeline, subs: int | None = 1, dom=None, stop_until=0.0,
+                     stop_elements: StopElementSource | None = None,
+                     poll_state: PollState | None = None):
             self.timeline = sorted(timeline, key=lambda x: x[0])
             self.subs, self.dom, self.stop_until = subs, dom, stop_until
+            self.stop_elements = stop_elements
+            self.poll_state = poll_state
+            self.stop_log = []
+
+        def stop_now(self, legacy: bool = False) -> bool:
+            source = self.stop_elements
+            if source is None:
+                return Clock.now < self.stop_until
+            if callable(source):
+                elements: list[FakeElement] = source(Clock.now)
+            else:
+                elements = source
+            if legacy:
+                # 旧 _POLL_CHAT_JS：只要布局矩形 + visibility 可见；透明仍算可见。
+                return any(el.connected and el.rects > 0
+                           and el.style.visibility not in ("hidden", "collapse")
+                           for el in elements)
+            return stop_visible(elements)
 
         def js(self, expr, *a, **k):
             if expr == muse_events.DRAIN_JS:
@@ -139,12 +194,20 @@ with tempfile.TemporaryDirectory() as home:
                 self.timeline = [(t, r) for t, r in self.timeline if t > Clock.now]
                 return drain_payload(self.subs, ready)
             if expr == muse_events.STOP_VISIBLE_JS:
-                return Clock.now < self.stop_until
+                return self.stop_now()
+            if expr == em.MuseEngine._POLL_CHAT_JS:
+                if self.poll_state is None:
+                    return None
+                cnt, text = self.poll_state(Clock.now)
+                # 旧实现未内嵌 STOP_VISIBLE_JS 时按旧判定模拟，让回归测试真的会失败。
+                stop = self.stop_now(legacy=muse_events.STOP_VISIBLE_JS not in expr)
+                self.stop_log.append(stop)
+                return json.dumps({"cnt": cnt, "total": cnt, "txt": text, "stop": stop})
             if "location.pathname" in expr:
                 return "/thread/424a43ce-c2e9-4a30-82de-d35311f33b5c"
             return None
 
-    def make(page, poll):
+    def make(page, poll: Callable[[], tuple[int, str, bool]] | None = None):
         e = em.MuseEngine.__new__(em.MuseEngine)
         e.cfg = SimpleNamespace(chat_timeout=300)
         e.ensure_page = lambda *a, **k: None
@@ -152,15 +215,16 @@ with tempfile.TemporaryDirectory() as home:
         e._send = lambda prompt: "clicked"
         e._confirm_sent = lambda *a: None
         e._user_count = lambda: 1
-        e._poll_chat = poll
-        e.chat_snapshot = lambda base=0: poll()[1]
+        if poll is not None:
+            e._poll_chat = poll
+            e.chat_snapshot = lambda base=0: poll()[1]
         e._page_override = page
         return e
 
     # MuseEngine.page 是线程本地属性；测试里直接替换类属性访问。
     em.MuseEngine.page = property(lambda self: self._page_override)
 
-    def run(page, poll, **kw):
+    def run(page, poll: Callable[[], tuple[int, str, bool]] | None, **kw):
         Clock.now = 0.0
         e = make(page, poll)
         finals, threads, timing = [], [], {}
@@ -232,6 +296,62 @@ with tempfile.TemporaryDirectory() as home:
         assert "".join(chunks) == intro + "\n\n" + call, chunks
         assert finals == [intro + "\n\n" + call]
 
+    def CHATSRC_B09_stop_visible_conditions():
+        cases = [
+            (True, [FakeElement()]),
+            (False, []),  # 选择器无命中：按钮已从 DOM 移除
+            (False, [FakeElement(connected=False), FakeElement(rects=0),
+                     FakeElement(width=0)]),
+            (False, [FakeElement(opacity=0), FakeElement(display="none"),
+                     FakeElement(visibility="hidden"), FakeElement(visibility="collapse")]),
+            (True, [FakeElement(disabled=True)]),  # disabled 不改变视觉呈现
+            (True, [FakeElement(aria_hidden=True)]),  # aria-hidden 不改变视觉呈现
+            (True, [FakeElement(attrs={"hidden": True})]),  # hidden 属性被覆盖仍可见
+            (False, [FakeElement(disabled=True, opacity=0),
+                     FakeElement(aria_hidden=True, display="none")]),  # 仍按视觉判定
+            (False, [FakeElement(parent=FakeElement(opacity=0)),
+                     FakeElement(parent=FakeElement(display="none"))]),
+            (True, [FakeElement(parent=FakeElement(aria_hidden=True))]),
+            (True, [FakeElement(parent=FakeElement(attrs={"hidden": True}))]),
+            (True, [FakeElement(parent=FakeElement(opacity=0.5), opacity=0.5)]),
+            (False, [FakeElement(parent=FakeElement(visibility="hidden"),
+                                 visibility="hidden")]),
+            (True, [FakeElement(parent=FakeElement(visibility="hidden"),
+                                visibility="visible")]),  # 后代可覆盖祖先 visibility
+            (True, [FakeElement(opacity=0), FakeElement()]),  # 任一候选可见即可
+        ]
+        for expected, elements in cases:
+            got = FakePage([], stop_elements=elements).js(muse_events.STOP_VISIBLE_JS)
+            assert got is expected, (got, expected, elements)
+
+    def CHATSRC_B10_dom_fallback_reuses_stop_visibility():
+        # DOM 兜底轮询必须复用事件流同一 Stop 视觉谓词；旧判定会把透明 Stop 当作可见。
+        assert muse_events.STOP_VISIBLE_JS in em.MuseEngine._POLL_CHAT_JS
+        assert "getClientRects().length>0&&getComputedStyle" not in em.MuseEngine._POLL_CHAT_JS
+
+        answer = "DOM 兜底完整正文"
+
+        def state(now: float) -> tuple[int, str]:
+            return (1, "上一轮") if now <= 0 else (2, answer)
+
+        # 1) Stop 透明：旧判定仍视为可见并持续阻塞；新判定按静默窗口正常收尾。
+        page = FakePage([], subs=0, poll_state=state,
+                        stop_elements=lambda now: [FakeElement(opacity=0)])
+        chunks, finals, threads, timing = run(page, None)
+        assert "".join(chunks) == answer and finals == [answer], (chunks, finals)
+        assert threads == ["424a43ce-c2e9-4a30-82de-d35311f33b5c"]
+        assert "source_events" not in timing and Clock.now < 5.0, Clock.now
+        assert page.stop_log and not any(page.stop_log), page.stop_log
+
+        # 2) Stop 可见期间持续阻塞，t3 消失后才按静默窗口结束。
+        stop_gone_at = 3.0
+        page = FakePage([], subs=0, poll_state=state,
+                        stop_elements=lambda now: [FakeElement()] if now < stop_gone_at else [])
+        chunks, finals, _, _ = run(page, None)
+        assert "".join(chunks) == answer and finals == [answer], (chunks, finals)
+        assert Clock.now >= stop_gone_at, ("Stop 可见时提前结束", Clock.now)
+        assert True in page.stop_log and page.stop_log[-1] is False, page.stop_log
+
     def CHATSRC_B07_cancel_returns_without_final():
         import threading
         stop = threading.Event()
@@ -258,4 +378,6 @@ with tempfile.TemporaryDirectory() as home:
     CHATSRC_B04_failed_raises()
     CHATSRC_B07_cancel_returns_without_final()
     CHATSRC_B08_waits_for_followup_message()
-    print("PASS: CHATSRC-B01..B08 event stream markdown, fallback, fill, failure, citations, cancel")
+    CHATSRC_B09_stop_visible_conditions()
+    CHATSRC_B10_dom_fallback_reuses_stop_visibility()
+    print("PASS: CHATSRC-B01..B10 event stream markdown, fallback, fill, failure, citations, cancel, stop visibility")

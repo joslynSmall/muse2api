@@ -9,7 +9,7 @@ upstream: []
 downstream: []
 related: [CHATSESS, CHATSRC]
 external: []
-last_verified: 2026-11-12
+last_verified: 2026-11-13
 ---
 
 # 旁聊数量清理（CHATPRUN）

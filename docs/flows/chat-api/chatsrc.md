@@ -9,7 +9,7 @@ upstream: []
 downstream: [CHATMSG]
 related: [CHATSESS, CHATPRUN]
 external: []
-last_verified: 2026-11-12
+last_verified: 2026-11-13
 ---
 
 # 网页回复采集（CHATSRC）
@@ -58,6 +58,10 @@ sequenceDiagram
         E->>E: 忽略，不输出
     else CHATSRC-B08 一轮多条消息（文字后接工具调用）
         Note over E: 已知消息都完成后仍等 Stop 消失并静默，期间新 message_start 继续收
+    else CHATSRC-B09 Stop 按钮视觉不可见
+        Note over E: 透明/display/visibility/零尺寸/祖先 opacity 隐藏不算“生成中”；disabled/aria-hidden/hidden 属性不参与
+    else CHATSRC-B10 DOM 兜底轮询的 Stop 判定
+        Note over E: 复用 CHATSRC-B09 视觉谓词；透明/隐藏 Stop 不阻塞收尾
     else CHATSRC-B07 取消
         E->>E: stop_event 置位立即返回
     end
@@ -75,6 +79,8 @@ sequenceDiagram
 | CHATSRC-B06 | 忽略非主对话与工具事件 | done | muse_events.py:81; muse_events.py:147 | tests/test_chat_events.py::CHATSRC_B06_ignores_other_messages | 不输出 | 只认发送后出现 message_start 的主对话 message_id；不订阅 tool 事件 | user |
 | CHATSRC-B07 | 取消 | done | engine.py:1819 | tests/test_chat_events.py::CHATSRC_B07_cancel_returns_without_final | 立即返回 | 不调用 on_final_text | model:与 DOM 路径取消语义一致 |
 | CHATSRC-B08 | 一轮多条消息：已完成消息后又出现新消息 | done | engine.py:1861 | tests/test_chat_events.py::CHATSRC_B08_waits_for_followup_message | 收齐全部消息后结束 | 已知消息全部 done 不等于本轮结束；需 Stop 消失并静默 ≥1s（工具请求 4s） | model:真实故障——首条文字 done 即结束，丢掉随后的 tool_call，Claude Code 停在开场白 |
+| CHATSRC-B09 | Stop 按钮视觉不可见时不计为生成中 | done | muse_events.py:69 | tests/test_chat_events.py::CHATSRC_B09_stop_visible_conditions | 真实终态后按既有 Stop 消失 + 静默窗口结束 | 按实际视觉呈现：在 DOM、有布局面积、自身有效 visibility 非 hidden/collapse、自身及祖先 display 非 none、自身及祖先 opacity 累乘 > 0；disabled/aria-hidden/hidden 属性不参与，以 computed display 为准；只收紧可见性判定，不改静默窗口 | user |
+| CHATSRC-B10 | DOM 兜底轮询复用 Stop 视觉判定 | done | engine.py:1659; muse_events.py:69 | tests/test_chat_events.py::CHATSRC_B10_dom_fallback_reuses_stop_visibility | Stop 不可见时按静默窗口正常结束；可见时持续阻塞到消失 | `_POLL_CHAT_JS` 的 stop 字段必须内嵌 `STOP_VISIBLE_JS`，不得恢复旧的 getClientRects+visibility 判定 | model:事件流与 DOM 兜底同一视觉口径，避免透明 Stop 下空转到超时 |
 
 ## 关联流程（边界分支）
 
@@ -94,6 +100,8 @@ sequenceDiagram
 
 | 日期 | 任务 | 变更的分支 ID |
 |---|---|---|
+| 2026-11-13 | DOM 兜底轮询复用 Stop 视觉判定，修复透明/隐藏 Stop 下空转到超时 | CHATSRC-B10 |
+| 2026-11-13 | 修正 Stop 视觉可见性判定：透明、display/visibility 隐藏、零尺寸、祖先 opacity 隐藏不阻塞；disabled/aria-hidden/hidden 属性不参与 | CHATSRC-B09 |
 | 2026-11-12 | 修复：首条消息完成即结束导致后续工具调用丢失 | CHATSRC-B08 |
 | 2026-11-12 | 实现事件流采集、DOM 兜底；真实账号验证 Markdown 保留 | CHATSRC-B01、CHATSRC-B02、CHATSRC-B03、CHATSRC-B04、CHATSRC-B05、CHATSRC-B06、CHATSRC-B07 |
 | 2026-11-12 | 对齐需求并登记分支 | CHATSRC-B01、CHATSRC-B02、CHATSRC-B03、CHATSRC-B04、CHATSRC-B05、CHATSRC-B06、CHATSRC-B07 |

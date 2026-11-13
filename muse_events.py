@@ -67,10 +67,25 @@ DRAIN_JS = (
 )
 
 STOP_VISIBLE_JS = (
-    "(function(){var es=[].slice.call(document.querySelectorAll("
-    "'[data-testid=\"hatch-composer-stop-button\"],button[aria-label*=\"Stop\" i],"
-    "button[aria-label*=\"停止\"]'));return es.some(function(e){"
-    "return e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';});})()"
+    "(function(){"
+    "function vis(e){"
+    "if(!e||!e.isConnected||!e.getClientRects().length)return false;"
+    "var r=e.getBoundingClientRect();if(!(r.width>0&&r.height>0))return false;"
+    # visibility 可被后代覆盖：只信按钮自身有效值；透明度沿祖先链累乘。
+    # disabled/aria-hidden/hidden 属性不改变视觉呈现，以 computed display 为准。
+    "var s=getComputedStyle(e),o=1;"
+    "if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse')return false;"
+    "for(var n=e;n&&n.nodeType===1;n=n.parentElement){"
+    "var c=n===e?s:getComputedStyle(n);if(c.display==='none')return false;"
+    "var x=parseFloat(c.opacity);o*=isNaN(x)?1:x;if(!(o>0))return false;"
+    "}"
+    "return true;"
+    "}"
+    "var es=document.querySelectorAll('[data-testid=\"hatch-composer-stop-button\"],"
+    "button[aria-label*=\"Stop\" i],button[aria-label*=\"停止\"]');"
+    "for(var i=0;i<es.length;i++)if(vis(es[i]))return true;"
+    "return false;"
+    "})()"
 )
 
 _CITE_RE = re.compile(r"【cite:([^】]+)】|【([^】†]+)†[^】]*】|\^\[([^\]\s]+)\]")
