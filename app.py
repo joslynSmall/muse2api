@@ -1066,7 +1066,7 @@ def _with_tools(prompt: str, tools: list | None, tool_choice=None) -> str:
 
 
 from tool_protocol import (ToolStreamSplitter, build_tools_prompt, build_tools_reminder,
-                            build_tool_call_correction, tool_call_problems,
+                            build_tool_call_correction, tool_call_problems, truncated_tool_call,
                             parse_tool_calls, tool_choice_value, tools_signature,
                             tool_choice_value as _tool_choice_value)
 
@@ -1188,7 +1188,12 @@ def _is_side_request(messages: list[ChatMessage]) -> bool:
     return any(line.lstrip().startswith(_SIDE_REQUEST_MARKERS) for line in head.splitlines())
 
 
-def _stream_tool_reply(chunks, tools, out: dict, retry=None, has_tool_results: bool = False):
+# 截断是概率性的：同一条长调用重发还会断，所以比格式错误多给一次纠正机会。
+_TRUNCATION_RETRIES = 2
+
+
+def _stream_tool_reply(chunks, tools, out: dict, retry=None, has_tool_results: bool = False,
+                       retries_left: int | None = None):
     """带工具的流式回复：正文增量立即产出，疑似 tool_call 的尾部暂扣到结束再解析。
 
     产出正文片段；结束后在 ``out`` 写入 ``calls``。最终正文以网页的完整快照为准：
@@ -1196,7 +1201,9 @@ def _stream_tool_reply(chunks, tools, out: dict, retry=None, has_tool_results: b
     Chat Completions 与 Messages 共用（CHATMSG-B09）。
 
     工具调用无法执行时（清单外工具、JSON 坏了、参数不符），这些调用不当正文发出；
-    给了 ``retry(纠正提示)`` 就在同一 thread 追发一次纠正并接着输出（CHATSESS-B16、CHATMSG-B12）；
+    给了 ``retry(纠正提示)`` 就在同一 thread 追发纠正并接着输出（CHATSESS-B16、CHATMSG-B12）。
+    格式错误只纠正一次：模型写错了，重发同样内容没有意义。回复被截断（JSON 坏到文本
+    末尾）时再给一次，因为截断是概率性的，而且纠正要求把长参数拆短（CHATMSG-B15）。
     无法重试时给出一句可见说明，不让客户端停在一段无法执行的文字上。
     """
     splitter = ToolStreamSplitter()
@@ -1217,17 +1224,25 @@ def _stream_tool_reply(chunks, tools, out: dict, retry=None, has_tool_results: b
     problems = tool_call_problems(source, calls, tools, has_tool_results)
     if problems:
         # 调用无法执行（清单外工具、JSON 坏了、参数不符）：不交给客户端（CHATMSG-B12）。
-        log.info("tool_call rejected problems=%s retry=%s", problems, retry is not None)
-        again = retry(build_tool_call_correction(problems, tools)) if retry else None
+        truncated = truncated_tool_call(source, calls, tools)
+        if retries_left is None:
+            retries_left = _TRUNCATION_RETRIES if truncated else 1
+        log.info("tool_call rejected problems=%s retry=%s truncated=%s left=%s",
+                 problems, retry is not None, truncated, retries_left)
+        again = (retry(build_tool_call_correction(problems, tools, truncated=truncated))
+                 if retry and retries_left else None)
         if again is not None:
             if streamed:
                 # 已发出的正文收不回；说明它没有被执行，再接纠正后的回复。
                 yield "\n\n（上面的回复没有实际执行：%s。已让模型重新发出工具调用。）\n\n" % problems[0]
-            yield from _stream_tool_reply(again, tools, out, None, has_tool_results)
+            yield from _stream_tool_reply(again, tools, out, retry, has_tool_results,
+                                           retries_left - 1)
             return
         out["calls"] = None
+        why = "回复在工具调用的 JSON 中间被截断，" if truncated else ""
         yield ("\n\n" if streamed else "") + (
-            "（模型输出的工具调用无法执行，已丢弃：%s。请重试或换个说法。）" % "；".join(problems))
+            "（模型输出的工具调用无法执行，已丢弃：%s%s。请重试或换个说法。）"
+            % (why, "；".join(problems)))
         return
     text = rest if calls else source
     sent = streamed.rstrip()

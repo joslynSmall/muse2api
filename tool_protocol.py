@@ -21,7 +21,8 @@ import uuid
 
 __all__ = ["build_tools_prompt", "build_tools_reminder", "parse_tool_calls", "tool_choice_value",
            "unknown_tool_names", "build_unknown_tool_correction",
-           "tool_call_problems", "build_tool_call_correction", "claims_execution"]
+           "tool_call_problems", "build_tool_call_correction", "claims_execution",
+           "truncated_tool_call"]
 
 
 _TOOL_PROTOCOL_HEAD = """【客户端工具说明】
@@ -33,14 +34,14 @@ _TOOL_PROTOCOL_HEAD = """【客户端工具说明】
 - 每个代码块只放一个 JSON 对象；要多个工具就写多个代码块。
 - name 必须是下面清单里的名字；arguments 必须是合法 JSON 对象。你自带的工具（如 browser.*、muse.*、搜索、画图）客户端执行不了，不要调用。
 - 不要用 json 代码块表示调用，也不要编造执行结果、退出码或主机名——命令还没跑过。
-- 长脚本或多行内容不要塞进命令参数：先用 Write 写成文件，再用 Bash 执行；只用工具定义里有的参数名。
+- 回复会被长度截断，写到一半的 JSON 执行不了。命令、脚本、文件内容这类参数不要写长：超过十行或可能超过一千个字符时，先用 Write 把内容写成文件，再用 Bash 执行这个短命令；只用工具定义里有的参数名。
 - 不需要工具时，直接用自然语言回答。
 
 可用工具（参数为 JSON Schema）：
 """
 
 _TOOL_REMINDER_HEAD = """【客户端工具说明（沿用前文）】
-工具清单和参数与前文相同。用户电脑上的操作只能通过下面的客户端工具完成；需要时只输出 ```tool_call 代码块（块内一个 JSON：{"name": "工具名", "arguments": {参数}}），然后结束回复等待结果。你自带的工具（如 browser.*、muse.*）客户端执行不了，不要调用。只用下面列出的参数名；长脚本先用 Write 写成文件再用 Bash 执行。不要编造执行结果；不需要工具时直接回答。
+工具清单和参数与前文相同。用户电脑上的操作只能通过下面的客户端工具完成；需要时只输出 ```tool_call 代码块（块内一个 JSON：{"name": "工具名", "arguments": {参数}}），然后结束回复等待结果。你自带的工具（如 browser.*、muse.*）客户端执行不了，不要调用。只用下面列出的参数名。回复会被长度截断，写到一半的 JSON 执行不了：命令、脚本、文件内容这类参数超过十行或可能超过一千个字符时，先用 Write 写成文件，再用 Bash 执行这个短命令。不要编造执行结果；不需要工具时直接回答。
 """
 
 # 只有工具清单里有 ToolSearch 时才追加：客户端把 MCP 等工具设为延迟加载，
@@ -581,28 +582,90 @@ def claims_execution(text: str) -> bool:
     return bool(_CLAIM_DONE_RE.search(text) and _CLAIM_OBJECT_RE.search(text))
 
 
-def _has_marker_with_json(text: str) -> bool:
-    """tool_call 标记后紧跟（或下一行是）``{`` / ``[``：意图明确是调用而非提及。"""
-    if not isinstance(text, str):
-        return False
+def _marker_json_starts(text: str):
+    """每个 tool_call 标记后紧跟（或下一行是）的 JSON 起点；没有的标记跳过。"""
+    starts = []
     for match in _INLINE_RE.finditer(text):
         start = _json_start(text, match.end())
         if start is None:
             nl = text.find("\n", match.end())
             start = _json_start(text, nl) if nl >= 0 else None
         if start is not None:
-            return True
+            starts.append(start)
+    return starts
+
+
+def _has_marker_with_json(text: str) -> bool:
+    """tool_call 标记后紧跟（或下一行是）``{`` / ``[``：意图明确是调用而非提及。"""
+    return isinstance(text, str) and bool(_marker_json_starts(text))
+
+
+def _ends_inside_json(text: str, start: int) -> bool:
+    """从 start 的 ``{`` / ``[`` 扫到文本结尾，仍停在未闭合的字符串或括号里。
+
+    括号错配算写错，不算截断：截断是生成停在半截 token 上，不会多写出一个对不上的括号。
+    结尾的空白和一个代码块收尾 ```` ``` ```` 不算额外内容。
+    """
+    body = re.sub(r"(?:\r?\n)?[ \t]*```[ \t]*\Z", "", text[start:]).rstrip()
+    stack: list[str] = []
+    in_str, esc = False, False
+    for ch in body:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                return False
+    return in_str or bool(stack)
+
+
+def truncated_tool_call(text: str, calls, tools=None) -> bool:
+    """回复有意发出工具调用，但 JSON 一直坏到文本末尾：生成被截断，不是写错。
+
+    判定只看坏掉的位置：从标记后的 ``{`` / ``[`` 起，标准解析和末尾补括号都失败，
+    且扫描停在未闭合的字符串或括号里。括号错配、或者错误之后还有内容的，是格式错误，
+    重发一次原样内容即可。已经解析出调用的不在这里判断。
+    """
+    if calls or not isinstance(text, str):
+        return False
+    if unknown_tool_names(text, tools):
+        return False
+    decoder = json.JSONDecoder()
+    for start in _marker_json_starts(text):
+        if _decode_lenient(text, start, decoder)[1] is not None:
+            continue
+        return _ends_inside_json(text, start)
     return False
 
 
-def build_tool_call_correction(problems: list[str], tools=None) -> str:
-    """工具调用有问题时，在同一 thread 追发的纠正提示（CHATMSG-B12）。"""
+def build_tool_call_correction(problems: list[str], tools=None, truncated: bool = False) -> str:
+    """工具调用有问题时，在同一 thread 追发的纠正提示（CHATMSG-B12）。
+
+    ``truncated`` 时说明上一条是被截断而非写错：原样重发还会断在同一个地方，
+    必须把长参数拆成先 Write 文件、再 Bash 执行的短调用。
+    """
     has_search = any(t["name"] == "ToolSearch" for t in _normalize_tools(tools))
     lines = ["【客户端提示】你上一条回复里的工具调用无法执行，已作废：",
-             *("- " + p for p in problems),
-             "请重新输出正确的调用：```tool_call 代码块内放一个完整、合法的 JSON 对象 "
-             '{"name": "工具名", "arguments": {参数}}，只用清单里的工具和参数名，然后结束回复。',
-             "长脚本或多行内容不要塞进命令参数：先用 Write 写成文件，再用 Bash 执行。"]
+             *("- " + p for p in problems)]
+    if truncated:
+        lines.append(
+            "这条回复在 JSON 字符串中间被截断了，所以不是格式问题，重发同样的内容还会断在同一个地方。"
+            "把长的命令、脚本或文件内容拆开：先用 Write 把内容写成文件，再用 Bash 执行这个短命令；"
+            "每个 ```tool_call 代码块里只放一个短的、完整的 JSON "
+            '{"name": "工具名", "arguments": {参数}}，然后结束回复。')
+    else:
+        lines += ["请重新输出正确的调用：```tool_call 代码块内放一个完整、合法的 JSON 对象 "
+                  '{"name": "工具名", "arguments": {参数}}，只用清单里的工具和参数名，然后结束回复。',
+                  "长脚本或多行内容不要塞进命令参数：先用 Write 写成文件，再用 Bash 执行。"]
     if has_search:
         lines.append('需要 mcp__ 开头的 MCP 工具时，先调用 ToolSearch，参数 '
                      '{"query": "select:工具全名", "max_results": 5}。')

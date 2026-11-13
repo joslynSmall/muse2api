@@ -432,5 +432,32 @@ def test_CHATMSG_B13_claims_execution_without_tool_call():
     assert calls and tp.tool_call_problems("", calls, TOOLS) == []
 
 
+def test_CHATMSG_B15_truncated_call_is_distinct_from_malformed():
+    # 真实故障：回复停在字符串中间，结尾的引号和括号都没写出来。
+    cut = 'tool_call\n{"name": "Bash", "arguments": {"command": "ls flowmap.js'
+    assert tp.parse_tool_calls(cut, TOOLS)[0] is None
+    assert tp.truncated_tool_call(cut, None, TOOLS)
+    # 只缺末尾括号的能补齐，不算截断。
+    repaired = 'tool_call\n{"name": "Bash", "arguments": {"command": "ls"}'
+    calls, _ = tp.parse_tool_calls(repaired, TOOLS)
+    assert calls and not tp.truncated_tool_call(repaired, calls, TOOLS)
+    # 括号错配出现在文本中间，后面还有内容：是写错，不是被截断。
+    prose = 'tool_call\n{"name": "Bash", "arguments": {"command": "ls"]}\n后面还有说明'
+    assert tp.parse_tool_calls(prose, TOOLS)[0] is None
+    assert not tp.truncated_tool_call(prose, None, TOOLS)
+    # 结尾只剩代码块收尾，仍然算截断。
+    fenced = '```tool_call\n{"name": "Bash", "arguments": {"command": "ls flowmap.js\n```'
+    assert tp.truncated_tool_call(fenced, None, TOOLS)
+    # 截断的纠正要指出"拆短重发"，而不是让模型原样重发一遍。
+    note = tp.build_tool_call_correction(["tool_call 后的 JSON 格式不完整或无法解析"],
+                                         TOOLS, truncated=True)
+    assert "截断" in note and "Write" in note and "重发同样的内容还会断" in note
+    plain = tp.build_tool_call_correction(["Bash 缺少必填参数 command"], TOOLS)
+    assert "截断" not in plain and "重新输出正确的调用" in plain
+    # 完整清单和续轮提醒都要写明长度上限，否则模型继续把长命令塞进参数。
+    for rendered in (tp.build_tools_prompt(TOOLS), tp.build_tools_reminder(TOOLS)):
+        assert "一千个字符" in rendered and "十行" in rendered, rendered
+
+
 if __name__ == "__main__":
     main()

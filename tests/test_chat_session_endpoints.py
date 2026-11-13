@@ -294,6 +294,19 @@ with tempfile.TemporaryDirectory() as home:
         status, body = tool_chat("claude-session-twice")
         assert len(seen) == 2 and "已丢弃" in body and '"finish_reason": "stop"' in body
 
+        # CHATMSG-B15：回复停在 JSON 字符串中间（被截断）→ 纠正两次，提示要求拆短重发。
+        cut = 'tool_call\n{"name": "Bash", "arguments": {"command": "ls flowmap.js'
+        seen.clear()
+        replies[:] = [cut, cut, good]
+        status, body = tool_chat("claude-session-truncated")
+        assert len(seen) == 3 and all("截断" in s["prompt"] for s in seen[1:]), seen
+        assert '"finish_reason": "tool_calls"' in body and '"name": "Bash"' in body, body
+        # 两次都断在同一个地方：给出可见说明，不再追发第三次。
+        seen.clear()
+        replies[:] = [cut, cut, cut]
+        status, body = tool_chat("claude-session-truncated-again")
+        assert len(seen) == 3 and "被截断" in body and '"finish_reason": "stop"' in body, body
+
         # CHATMSG-B13：没调用工具却声称已执行 → 同一 thread 纠正，拿到真实调用。
         seen.clear()
         replies[:] = ['已生成并执行，cat fmt.txt 的真实内容是：1 4 9', good]
