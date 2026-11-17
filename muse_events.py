@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 BOOTSTRAP_JS = r"""
 (function(){
   if (window.__MUSE_EVT__) return;
-  var S = window.__MUSE_EVT__ = {q: [], subs: 0, dropped: 0, err: ''};
+  var S = window.__MUSE_EVT__ = {q: [], subs: 0, dropped: 0, err: '', scan: null};
   var NAMES = ['delta.message_start', 'delta.text_append', 'delta.message_done'];
   var hooked = new WeakSet(), seen = new WeakSet();
   function push(name, payload, meta){
@@ -41,7 +41,7 @@ BOOTSTRAP_JS = r"""
     for (var i = 0; f && i < 500; i++, f = f.return) {
       var v = f.memoizedProps && f.memoizedProps.value;
       if (!v || typeof v !== 'object' || typeof v.onEvent !== 'function'
-          || typeof v.sendRequest !== 'function' || v.isReady !== true
+          || typeof v.sendRequest !== 'function'
           || hooked.has(v.onEvent)) continue;
       hooked.add(v.onEvent);
       NAMES.forEach(function(name){
@@ -53,18 +53,17 @@ BOOTSTRAP_JS = r"""
     }
   }
   function scan(){
-    try { hook(document.querySelector('textarea')); hook(document.querySelector('main')); }
-    catch (err) { S.err = String(err).slice(0, 200); }
+    try {
+      hook(document.querySelector('textarea'));
+      hook(document.querySelector('main'));
+      hook(document.body);
+    } catch (err) { S.err = String(err).slice(0, 200); }
   }
+  S.scan = scan;
   setInterval(scan, 400);
   scan();
 })();
 """
-
-DRAIN_JS = (
-    "(function(){var S=window.__MUSE_EVT__;if(!S)return null;"
-    "return JSON.stringify({subs:S.subs,dropped:S.dropped,q:S.q.splice(0,400)});})()"
-)
 
 STOP_VISIBLE_JS = (
     "(function(){"
@@ -88,9 +87,21 @@ STOP_VISIBLE_JS = (
     "})()"
 )
 
+DRAIN_JS = (
+    "(function(){var S=window.__MUSE_EVT__;if(!S)return null;"
+    "if(S.scan)try{S.scan();}catch(e){}"
+    "return JSON.stringify({subs:S.subs,dropped:S.dropped,q:S.q.splice(0,4000),"
+    "stop:" + STOP_VISIBLE_JS + "});})()"
+)
+
 _CITE_RE = re.compile(r"【cite:([^】]+)】|【([^】†]+)†[^】]*】|\^\[([^\]\s]+)\]")
-# 尚未闭合的引用标记：暂扣，等后续片段或 message_done。
-_OPEN_CITE_RE = re.compile(r"【[^】]*$|\^(?:\[[^\]\s]*)?$")
+# 尚未闭合的引用标记：暂扣，等后续片段或 message_done（只匹配【开头的未闭合引用，不截断 ^ 正则）。
+_OPEN_CITE_RE = re.compile(r"【(?:[^】\n]{0,48})$")
+_FENCE_LINE_RE = re.compile(r"(?m)^[ \t]*```")
+
+
+def _in_code_fence(text: str, pos: int) -> bool:
+    return len(_FENCE_LINE_RE.findall(text, 0, pos)) % 2 == 1
 
 
 def _is_main(payload: dict) -> bool:
@@ -118,11 +129,60 @@ def _http_url(value) -> str | None:
     return None
 
 
+def _extract_transcript_text(transcript, mid: str | None = None) -> str | None:
+    if isinstance(transcript, str) and transcript:
+        return transcript
+    if isinstance(transcript, dict):
+        for key in ("display_text", "text", "content", "markdown"):
+            val = transcript.get(key)
+            if isinstance(val, str) and val:
+                return val
+        for key in ("parts", "blocks", "items", "messages", "turns"):
+            if key in transcript:
+                got = _extract_transcript_text(transcript.get(key), mid=mid)
+                if got:
+                    return got
+    if isinstance(transcript, list):
+        if mid:
+            for item in transcript:
+                if isinstance(item, dict) and str(item.get("message_id") or item.get("id") or "") == mid:
+                    got = _extract_transcript_text(item, mid=None)
+                    if got:
+                        return got
+        # 若为对话轮次列表，只取最后一条助手消息，避免把历史消息当成本轮补齐。
+        has_roles = any(isinstance(i, dict) and (i.get("role") or i.get("sender")) for i in transcript)
+        if has_roles:
+            for item in reversed(transcript):
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or item.get("sender") or "").lower()
+                if role in ("assistant", "agent", "model", "bot"):
+                    got = _extract_transcript_text(item, mid=None)
+                    if got:
+                        return got
+            return None
+        parts = []
+        for item in transcript:
+            if isinstance(item, str) and item:
+                parts.append(item)
+            elif isinstance(item, dict):
+                got = _extract_transcript_text(item, mid=None)
+                if got:
+                    parts.append(got)
+        if parts:
+            return "".join(parts) if all(isinstance(i, dict) and i.get("type") == "text" for i in transcript) else "\n\n".join(parts)
+    return None
+
+
 def _done_text(payload: dict) -> str | None:
     for key in ("display_text", "content"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return value
+    transcript = payload.get("transcript")
+    if transcript is not None:
+        mid = str(payload.get("message_id") or "") or None
+        return _extract_transcript_text(transcript, mid=mid)
     return None
 
 
@@ -217,11 +277,22 @@ class ReplyAssembler:
         raw = "\n\n".join(self.msgs[m]["text"] for m in self.order if self.msgs[m]["text"])
         out, pos = [], 0
         for match in _CITE_RE.finditer(raw):
+            if _in_code_fence(raw, match.start()):
+                out.append(raw[pos:match.end()])
+                pos = match.end()
+                continue
+            is_caret = match.group(3) is not None
             cid = next(g for g in match.groups() if g)
             link = self.citations.get(cid.strip())
-            if link is None and not final:
-                # 链接还不知道：从这里暂扣，等 message_done 带来资源。
-                return "".join(out) + raw[pos:match.start()]
+            if link is None:
+                if is_caret:
+                    # 正则表达式 ^[0-9] 等无对应引用资源时原样保留，不能暂扣或删除。
+                    out.append(raw[pos:match.end()])
+                    pos = match.end()
+                    continue
+                if not final:
+                    # 链接还不知道：从这里暂扣，等 message_done 带来资源。
+                    return "".join(out) + raw[pos:match.start()]
             out.append(raw[pos:match.start()])
             if link:
                 title = link[0].replace("[", "\\[").replace("]", "\\]")
@@ -230,7 +301,7 @@ class ReplyAssembler:
         rest = raw[pos:]
         if not final:
             tail = _OPEN_CITE_RE.search(rest)
-            if tail:
+            if tail and not _in_code_fence(raw, pos + tail.start()):
                 rest = rest[:tail.start()]
         out.append(rest)
         return "".join(out)
@@ -248,8 +319,8 @@ class ReplyAssembler:
         return self._render(final=True)
 
 
-def parse_drain(raw) -> tuple[int, list[dict]] | None:
-    """解析 DRAIN_JS 的结果；页面没有注入脚本时返回 None。"""
+def parse_drain_with_stop(raw) -> tuple[int, list[dict], bool | None] | None:
+    """解析 DRAIN_JS 的结果（含 stop 可见性）；页面没有注入脚本时返回 None。"""
     if not isinstance(raw, str):
         return None
     try:
@@ -264,4 +335,11 @@ def parse_drain(raw) -> tuple[int, list[dict]] | None:
             continue
         if isinstance(rec, dict):
             records.append(rec)
-    return int(data.get("subs") or 0), records
+    stop = data.get("stop")
+    return int(data.get("subs") or 0), records, (stop if isinstance(stop, bool) else None)
+
+
+def parse_drain(raw) -> tuple[int, list[dict]] | None:
+    """解析 DRAIN_JS 的结果；页面没有注入脚本时返回 None。"""
+    parsed = parse_drain_with_stop(raw)
+    return (parsed[0], parsed[1]) if parsed is not None else None

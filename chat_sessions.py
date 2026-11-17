@@ -16,6 +16,8 @@ from typing import Any
 
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# 单个 Muse thread 累积轮次上限：超过后同一账号自动新开干净 thread 重绑，避免百轮长会话拖垮页面。
+MAX_THREAD_FINGERPRINTS = 60
 
 
 def input_fingerprints(messages: list[Any]) -> list[str]:
@@ -93,6 +95,42 @@ class ChatSessionStore:
                 os.unlink(temp)
 
     @staticmethod
+    def extract_identity(headers, *, metadata=None, prompt_cache_key: str | None = None,
+                         user: str | None = None) -> tuple[str | None, str | None]:
+        """从请求头和兼容请求体字段提取会话标识，未提供时返回 (None, None)。"""
+        hdr = headers or {}
+        agent_id = (hdr.get("x-claude-code-agent-id") or hdr.get("x-agent-id") or "").strip() or None
+        for hkey in ("x-claude-code-session-id", "x-session-id",
+                     "x-conversation-id", "openai-conversation-id"):
+            val = hdr.get(hkey)
+            if isinstance(val, str) and val.strip():
+                return val.strip(), agent_id
+        if isinstance(metadata, dict):
+            msid = metadata.get("session_id")
+            if isinstance(msid, str) and msid.strip():
+                return msid.strip(), agent_id
+            muid = metadata.get("user_id")
+            if isinstance(muid, str) and muid.strip():
+                raw = muid.strip()
+                if raw.startswith("{"):
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict) and isinstance(parsed.get("session_id"), str) and parsed["session_id"].strip():
+                            return parsed["session_id"].strip(), agent_id
+                    except (TypeError, ValueError):
+                        pass
+                if len(raw) > 128:
+                    raw = "meta:" + hashlib.sha256(raw.encode()).hexdigest()[:32]
+                return raw, agent_id
+        for extra in (prompt_cache_key, user):
+            if isinstance(extra, str) and extra.strip():
+                val = extra.strip()
+                if len(val) > 128:
+                    val = "body:" + hashlib.sha256(val.encode()).hexdigest()[:32]
+                return val, agent_id
+        return None, None
+
+    @staticmethod
     def key(session_id: str | None, agent_id: str | None = None) -> str | None:
         session_id = (session_id or "").strip()
         agent_id = (agent_id or "").strip()
@@ -140,6 +178,10 @@ class ChatSessionStore:
         account = row.get("account_id")
         if len(fingerprints) < len(known) or fingerprints[:len(known)] != known:
             # /compact 或自动压缩会改写历史前缀；同一账号新开 thread 并重绑。
+            return SessionPlan("rebind", key, account_id=account,
+                               messages=list(messages), fingerprints=fingerprints)
+        if len(known) >= MAX_THREAD_FINGERPRINTS and len(fingerprints) > len(known):
+            # 同一 thread 累积轮次过多会显著拖慢页面渲染与上游响应；平滑重绑到干净 thread。
             return SessionPlan("rebind", key, account_id=account,
                                messages=list(messages), fingerprints=fingerprints)
         inputs = [m for m in messages if getattr(m, "role", None) in ("user", "tool")]

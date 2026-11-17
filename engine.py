@@ -219,6 +219,10 @@ class MuseGenerationError(RuntimeError):
     pass
 
 
+class MuseStalePageError(MuseGenerationError):
+    """Reused parked page lost its connection and should fall back to a cold reload."""
+
+
 class MuseProxyError(MuseGenerationError):
     """The account's configured proxy failed; this is not Cookie invalidation."""
 
@@ -304,6 +308,7 @@ class MuseEngine:
         self._local = threading.local()
         self._start_lock = threading.Lock()
         self._active_contexts: set[str] = set()
+        self._account_contexts: dict[str, dict] = {}
         self._contexts_lock = threading.Lock()
         self._proxy_relays: set[HTTPProxyRelay] = set()
         self._download_dirs: set[str] = set()
@@ -346,9 +351,33 @@ class MuseEngine:
     def current_context_id(self, val: str | None):
         self._ensure_local().current_context_id = val
 
+    @property
+    def current_target_id(self) -> str | None:
+        return getattr(self._ensure_local(), "current_target_id", None)
+
+    @current_target_id.setter
+    def current_target_id(self, val: str | None):
+        self._ensure_local().current_target_id = val
+
     # ---------------- 浏览器生命周期 ----------------
     def _debug_url(self):
         return f"http://127.0.0.1:{self.cfg.cdp_port}/json/version"
+
+    def _clear_profile_locks(self):
+        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            lp = os.path.join(self.cfg.profile_dir, lock_name)
+            if os.path.exists(lp) or os.path.islink(lp):
+                try:
+                    os.unlink(lp)
+                except Exception:
+                    pass
+
+    def _dispose_all_account_contexts(self):
+        ctx_map = getattr(self, "_account_contexts", None)
+        if not ctx_map:
+            return
+        for aid in list(ctx_map):
+            self.dispose_account_context(aid)
 
     def start(self):
         with self._start_lock:
@@ -379,35 +408,53 @@ class MuseEngine:
                 except Exception:
                     pass
 
-            # 清理残留锁
-            for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-                lp = os.path.join(self.cfg.profile_dir, lock_name)
-                if os.path.exists(lp) or os.path.islink(lp):
-                    try:
-                        os.unlink(lp)
-                    except Exception:
-                        pass
+            self.browser = None
+            self._dispose_all_account_contexts()
 
             os.makedirs(self.cfg.data_dir, exist_ok=True)
-            self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
             cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
-            self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
-                                         env=env, cwd=cwd_dir)
             last = None
-            for _ in range(90):
-                try:
-                    v = http_json(self._debug_url(), timeout=2)
-                    self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    last = exc
-                    time.sleep(1)
+            for launch_attempt in range(2):
+                self._clear_profile_locks()
+                if self._log:
+                    try:
+                        self._log.close()
+                    except Exception:
+                        pass
+                self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
+                self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
+                                             env=env, cwd=cwd_dir, start_new_session=True)
+                early_exit = False
+                for idx in range(80):
+                    rc = self.proc.poll()
+                    if rc is not None:
+                        early_exit = True
+                        last = RuntimeError(f"Chromium 启动进程提前退出 (code={rc})")
+                        break
+                    try:
+                        v = http_json(self._debug_url(), timeout=1.5)
+                        if v and "webSocketDebuggerUrl" in v:
+                            self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                            return
+                    except Exception as exc:  # noqa: BLE001
+                        last = exc
+                    time.sleep(0.1 if idx < 30 else 0.25)
+
+                if not early_exit and self.proc.poll() is None:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=3)
+                    except Exception:  # noqa: BLE001
+                        self.proc.kill()
+                if launch_attempt == 0:
+                    time.sleep(0.3)
             raise MuseGenerationError(f"Chromium 启动失败: {last}")
 
     def stop(self):
         with self._start_lock:
-            self._close_page()
+            self._close_page(dispose_context=True)
             self.discard_parked()
+            self._dispose_all_account_contexts()
             if self.browser:
                 with self._contexts_lock:
                     for ctx_id in list(self._active_contexts):
@@ -428,6 +475,12 @@ class MuseEngine:
                 except Exception:  # noqa: BLE001
                     self.proc.kill()
             self.proc = None
+            if self._log:
+                try:
+                    self._log.close()
+                except Exception:
+                    pass
+                self._log = None
             with self._contexts_lock:
                 relays = list(self._proxy_relays)
                 self._proxy_relays.clear()
@@ -452,32 +505,83 @@ class MuseEngine:
             self._download_dirs.add(directory)
         return directory
 
-    def _close_page(self):
-        """关闭当前线程专属的页面并销毁隔离的 BrowserContext，彻底释放内存与 Session。"""
+    def dispose_account_context(self, account_id: str | None):
+        """显式销毁指定账号的持久 BrowserContext 与关联代理中继。"""
+        if not account_id:
+            return
+        ctx_map = getattr(self, "_account_contexts", None)
+        if not ctx_map:
+            return
+        lock = getattr(self, "_contexts_lock", None)
+        if lock is not None:
+            with lock:
+                entry = ctx_map.pop(account_id, None)
+        else:
+            entry = ctx_map.pop(account_id, None)
+        if not entry:
+            return
+        ctx_id = entry.get("ctx_id")
+        if ctx_id and self.browser:
+            try:
+                self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
+            except Exception:  # noqa: BLE001
+                pass
+        relay = entry.get("proxy_relay")
+        if relay:
+            try:
+                relay.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if lock is not None:
+                with lock:
+                    self._proxy_relays.discard(relay)
+            else:
+                self._proxy_relays.discard(relay)
+
+    def _close_page(self, dispose_context: bool = False):
+        """关闭当前线程专属的页面；按需保留账号级持久 BrowserContext 缓存，否则销毁上下文。"""
+        local = self._ensure_local()
         p = self.page
         ctx_id = self.current_context_id
+        target_id = getattr(local, "current_target_id", None)
         if p:
             try:
                 p.close()
             except Exception:
                 pass
             self.page = None
-        if ctx_id and self.browser:
+        if target_id and self.browser:
             try:
-                self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
+                self.browser.send("Target.closeTarget", {"targetId": target_id})
             except Exception:
                 pass
+        local.current_target_id = None
+
+        owner_aid = None
+        ctx_map = getattr(self, "_account_contexts", None)
+        if ctx_id and ctx_map:
             with self._contexts_lock:
-                self._active_contexts.discard(ctx_id)
-            self.current_context_id = None
+                owner_aid = next((aid for aid, ent in ctx_map.items() if ent.get("ctx_id") == ctx_id), None)
+                if owner_aid and dispose_context:
+                    ctx_map.pop(owner_aid, None)
+
+        keep_ctx = bool(owner_aid and not dispose_context)
+        if not keep_ctx:
+            if ctx_id and self.browser:
+                try:
+                    self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
+                except Exception:
+                    pass
+                with self._contexts_lock:
+                    self._active_contexts.discard(ctx_id)
+            relay = getattr(local, "proxy_relay", None)
+            if relay:
+                relay.close()
+                with self._contexts_lock:
+                    self._proxy_relays.discard(relay)
+        self.current_context_id = None
         self.current_acc_id = None
-        local = self._ensure_local()
-        relay = getattr(local, "proxy_relay", None)
-        if relay:
-            relay.close()
-            with self._contexts_lock:
-                self._proxy_relays.discard(relay)
-            local.proxy_relay = None
+        local.proxy_relay = None
         local.proxy_config = None
         directory = getattr(local, "download_dir", None)
         if directory:
@@ -486,61 +590,110 @@ class MuseEngine:
                 self._download_dirs.discard(directory)
             local.download_dir = None
 
-    def _open_page(self, proxy: dict | None = None):
-        """Create an isolated account context; never fall back to shared cookies."""
-        if not self.browser:
-            error = MuseProxyError if proxy else MuseGenerationError
-            raise error("浏览器未连接，无法创建独立账号会话；未回退共享标签页")
-        page = None
-        try:
-            if proxy:
-                relay = HTTPProxyRelay(proxy)
-                self._ensure_local().proxy_relay = relay
-                with self._contexts_lock:
-                    self._proxy_relays.add(relay)
+    def _create_browser_context(self, proxy: dict | None):
+        relay = None
+        if proxy:
+            relay = HTTPProxyRelay(proxy)
+            with self._contexts_lock:
+                self._proxy_relays.add(relay)
+            try:
                 res = self.browser.send("Target.createBrowserContext", {
                     "proxyServer": relay.url,
                     "proxyBypassList": "<-loopback>",
                 })
-            else:
-                res = self.browser.send("Target.createBrowserContext")
-            ctx_id = res.get("result", {}).get("browserContextId")
-            if not ctx_id:
-                raise MuseGenerationError("Chromium 未返回独立上下文 ID")
-            self.current_context_id = ctx_id
-            with self._contexts_lock:
-                self._active_contexts.add(ctx_id)
-            t_res = self.browser.send("Target.createTarget", {
-                "url": "about:blank", "browserContextId": ctx_id,
-            })
-            target_id = t_res.get("result", {}).get("targetId")
-            if not target_id:
-                raise MuseGenerationError("Chromium 未返回独立页面 ID")
-            ws_url = f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}"
-            page = CDP(ws_url, timeout=180)
-            page.send("Network.enable")
-            page.send("Page.enable")
-            page.send("Runtime.enable")
-            # 页面每次加载都先注入回复事件订阅（CHATSRC）；失败不影响 DOM 兜底。
-            try:
-                page.send("Page.addScriptToEvaluateOnNewDocument",
-                          {"source": muse_events.BOOTSTRAP_JS})
-            except Exception:  # noqa: BLE001
-                log.warning("注入回复事件订阅失败，将只用 DOM 读取", exc_info=True)
-            page.send("Browser.setDownloadBehavior", {
-                "behavior": "allow", "downloadPath": self._new_download_dir(),
-                "browserContextId": ctx_id,
-            })
-            return page
-        except Exception:
-            if page:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-            self._close_page()
+            except Exception:
+                relay.close()
+                with self._contexts_lock:
+                    self._proxy_relays.discard(relay)
+                raise
+        else:
+            res = self.browser.send("Target.createBrowserContext")
+        ctx_id = res.get("result", {}).get("browserContextId")
+        if not ctx_id:
+            if relay:
+                relay.close()
+                with self._contexts_lock:
+                    self._proxy_relays.discard(relay)
+            raise MuseGenerationError("Chromium 未返回独立上下文 ID")
+        return ctx_id, relay
+
+    def _open_page(self, proxy: dict | None = None, account_id: str | None = None):
+        """Create or reuse an isolated account context; never fall back to shared cookies."""
+        if not self.browser:
             error = MuseProxyError if proxy else MuseGenerationError
-            raise error("无法创建该账号的独立浏览器会话；未回退共享标签页或直连") from None
+            raise error("浏览器未连接，无法创建独立账号会话；未回退共享标签页")
+        local = self._ensure_local()
+        if account_id is None:
+            account_id = getattr(local, "opening_account_id", None)
+        for attempt in range(2 if account_id else 1):
+            page = None
+            reused_ctx = False
+            try:
+                ctx_map = getattr(self, "_account_contexts", None)
+                entry = None
+                if account_id and ctx_map is not None:
+                    with self._contexts_lock:
+                        cand = ctx_map.get(account_id)
+                    if cand is not None:
+                        if cand.get("proxy_config") == proxy:
+                            entry = cand
+                        else:
+                            self.dispose_account_context(account_id)
+                if entry is not None:
+                    ctx_id = entry["ctx_id"]
+                    relay = entry.get("proxy_relay")
+                    reused_ctx = True
+                else:
+                    ctx_id, relay = self._create_browser_context(proxy)
+                    if account_id and ctx_map is not None:
+                        with self._contexts_lock:
+                            ctx_map[account_id] = {
+                                "ctx_id": ctx_id,
+                                "proxy_config": copy.deepcopy(proxy),
+                                "proxy_relay": relay,
+                                "cookie_sig": None,
+                            }
+                    else:
+                        with self._contexts_lock:
+                            self._active_contexts.add(ctx_id)
+
+                self.current_context_id = ctx_id
+                local.proxy_relay = relay
+                local.proxy_config = copy.deepcopy(proxy)
+                t_res = self.browser.send("Target.createTarget", {
+                    "url": "about:blank", "browserContextId": ctx_id,
+                })
+                target_id = t_res.get("result", {}).get("targetId")
+                if not target_id:
+                    raise MuseGenerationError("Chromium 未返回独立页面 ID")
+                self.current_target_id = target_id
+                ws_url = f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}"
+                page = CDP(ws_url, timeout=180)
+                page.send("Network.enable")
+                page.send("Page.enable")
+                page.send("Runtime.enable")
+                # 页面每次加载都先注入回复事件订阅（CHATSRC）；失败不影响 DOM 兜底。
+                try:
+                    page.send("Page.addScriptToEvaluateOnNewDocument",
+                              {"source": muse_events.BOOTSTRAP_JS})
+                except Exception:  # noqa: BLE001
+                    log.warning("注入回复事件订阅失败，将只用 DOM 读取", exc_info=True)
+                page.send("Browser.setDownloadBehavior", {
+                    "behavior": "allow", "downloadPath": self._new_download_dir(),
+                    "browserContextId": ctx_id,
+                })
+                return page
+            except Exception:
+                if page:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                self._close_page(dispose_context=True)
+                if reused_ctx and attempt == 0:
+                    continue
+                error = MuseProxyError if proxy else MuseGenerationError
+                raise error("无法创建该账号的独立浏览器会话；未回退共享标签页或直连") from None
 
     @staticmethod
     def renew_session_http(cookies: dict, expires: dict | None = None,
@@ -591,9 +744,9 @@ class MuseEngine:
                     cur_exp[c.name] = int(float(c.expires))
             vm_id = sj.get("vm_id")
             vm_state = sj.get("vm_state")
-            wake_ok = False
+            wake_ok = vm_state == "RUNNING"
             wake_requested = False
-            if wake_vm and vm_id and vm_state != "DISABLED":
+            if wake_vm and vm_id and vm_state not in ("DISABLED", "RUNNING"):
                 try:
                     headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v)
                     rw = requests.post("https://muse.ai/api/hatch/vm/wake", headers=headers, json={
@@ -635,33 +788,56 @@ class MuseEngine:
             }
 
     def _apply_cookies(self, page: CDP, cookies: dict, expires: dict | None = None):
-        """注入 cookie。彻底清空旧账号 cookie 保证隔离，且绝不传入过去时间的 expires 防止 Chromium 丢弃 hatch_vml。"""
-        try:
-            page.send("Network.clearBrowserCookies")
-        except Exception:
-            pass
+        """批量注入 cookie；新上下文先清空旧状态，持久上下文保留运行时 cookie 并增量刷新凭据。"""
+        ctx_id = self.current_context_id
+        ctx_entry = None
+        ctx_map = getattr(self, "_account_contexts", None)
+        if ctx_id and ctx_map:
+            with self._contexts_lock:
+                ctx_entry = next((ent for ent in ctx_map.values() if ent.get("ctx_id") == ctx_id), None)
+
+        if ctx_entry is None or ctx_entry.get("cookie_sig") is None:
+            try:
+                page.send("Network.clearBrowserCookies")
+            except Exception:
+                pass
+
         now = time.time()
-        for name, value in cookies.items():
+        cookie_list = []
+        sig_pairs = []
+        for name, value in (cookies or {}).items():
             if not value:
                 continue
+            sig_pairs.append((name, str(value)))
             exp = (expires or {}).get(name)
             try:
                 exp_val = float(exp) if exp and float(exp) > now + 3600 else (now + 7 * 86400)
             except (TypeError, ValueError):
                 exp_val = now + 7 * 86400
             for dom in (".muse.ai", "muse.ai"):
-                params = {
+                cookie_list.append({
                     "name": name,
                     "value": value,
                     "domain": dom,
                     "path": "/",
                     "secure": True,
                     "expires": exp_val,
-                }
-                try:
-                    page.send("Network.setCookie", params)
-                except Exception:  # noqa: BLE001
-                    pass
+                })
+        if cookie_list:
+            batch_ok = False
+            try:
+                res = page.send("Network.setCookies", {"cookies": cookie_list})
+                batch_ok = isinstance(res, dict) and not res.get("error")
+            except Exception:  # noqa: BLE001
+                batch_ok = False
+            if not batch_ok:
+                for params in cookie_list:
+                    try:
+                        page.send("Network.setCookie", params)
+                    except Exception:  # noqa: BLE001
+                        pass
+        if ctx_entry is not None:
+            ctx_entry["cookie_sig"] = tuple(sorted(sig_pairs))
 
     def read_cookies(self) -> dict[str, dict]:
         """从当前页面读回 cookie（**包含 httpOnly**，这是网页 JS 做不到的）。
@@ -689,27 +865,67 @@ class MuseEngine:
             out[name] = {"value": c.get("value", ""), "expires": exp}
         return out
 
+    # 页面状态横幅（Connecting... / Still sending）只在页面 chrome 中出现；聊天气泡、
+    # 代码块里的同名文字（例如 git diff 里贴出的本项目源码）绝不能被当成连接状态。
+    _STATUS_TEXT_FN_JS = r"""function __museStatus(words){
+        var body = document.body;
+        if (!body) return '';
+        var raw = body.textContent || '';
+        var hit = words.filter(function(w){ return raw.indexOf(w) !== -1; });
+        if (!hit.length) return '';
+        var skip = 'div[class*="hatch-chat-groupable-bubble"],pre,code,textarea,[contenteditable="true"]';
+        var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+        var n;
+        while ((n = walker.nextNode())) {
+            var v = n.nodeValue || '';
+            for (var i = 0; i < hit.length; i++) {
+                if (v.indexOf(hit[i]) === -1) continue;
+                var el = n.parentElement;
+                if (!el || el.closest(skip)) continue;
+                if (!el.getClientRects().length) continue;
+                return hit[i];
+            }
+        }
+        return '';
+    }"""
+
+    _WS_READY_JS = """(function(){
+        """ + _STATUS_TEXT_FN_JS + """
+        if (document.readyState !== 'complete') return 'loading';
+        var ta = document.querySelector('textarea');
+        if (!ta) return 'no-ta';
+        var h = document.querySelector('[data-hatch-shell-hydration-state]');
+        if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
+        // Gateway 对象的 isReady 是权威信号；拿不到时才看页面状态横幅。
+        var gw = null;
+        var key = Object.keys(ta).find(function(k){ return k.indexOf('__reactFiber$') === 0; });
+        if (key) {
+            for (var f = ta[key], i = 0; f && i < 500; i++, f = f.return) {
+                var v = f.memoizedProps && f.memoizedProps.value;
+                if (v && typeof v === 'object' && typeof v.sendRequest === 'function') { gw = v; break; }
+            }
+        }
+        if (gw && gw.isReady === false) return 'ws-not-ready';
+        if (!(gw && gw.isReady === true) && __museStatus(['Connecting...', '正在连接'])) return 'connecting';
+        // Empty composers may not render Send until text has been entered.
+        if (ta.disabled) return 'input-disabled';
+        if (typeof window !== 'undefined' && window.__MUSE_EVT__ && window.__MUSE_EVT__.scan) {
+            try { window.__MUSE_EVT__.scan(); } catch (e) {}
+        }
+        return 'ready';
+    })()"""
+
     def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
-        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
+        """等待 muse.ai 页面完成 React hydration、Gateway 就绪且不再处于连接中。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                st = page.js("""(function(){
-                    if (document.readyState !== 'complete') return 'loading';
-                    if (!document.querySelector('textarea')) return 'no-ta';
-                    var h = document.querySelector('[data-hatch-shell-hydration-state]');
-                    if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
-                    var b = document.body ? (document.body.innerText || '') : '';
-                    if (b.indexOf('Connecting...') !== -1) return 'connecting';
-                    // Empty composers may not render Send until text has been entered.
-                    if (document.querySelector('textarea').disabled) return 'input-disabled';
-                    return 'ready';
-                })()""")
+                st = page.js(self._WS_READY_JS)
                 if st == "ready":
                     return True
             except Exception:
                 pass
-            time.sleep(0.1)
+            time.sleep(0.08)
         return False
 
     def reset_thread(self, for_chat: bool = False):
@@ -719,6 +935,7 @@ class MuseEngine:
             return
         try:
             needs_nav = self.page.js("""(function(forChat){
+                """ + self._STATUS_TEXT_FN_JS + """
                 var d = document.querySelector('[role="dialog"]');
                 if (d) {
                     var b = d.querySelector('button[aria-label*="close" i], button');
@@ -730,8 +947,7 @@ class MuseEngine:
                 var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                     || document.querySelector('button[aria-label*="Stop" i]')
                     || document.querySelector('button[aria-label*="停止"]'));
-                var bodyTxt = document.body ? (document.body.innerText || '') : '';
-                var hasStuck = bodyTxt.indexOf('Still sending') !== -1 || bodyTxt.indexOf('Connecting...') !== -1;
+                var hasStuck = !!__museStatus(['Still sending', 'Connecting...']);
                 if (hasStop || hasStuck || hasAtts) return true;
                 if (forChat) {
                     return bubbleCount >= 24;
@@ -791,7 +1007,11 @@ class MuseEngine:
             except Exception as e:
                 log.warning("预续签 /api/session 失败（继续尝试浏览器加载）: %s", e)
 
-        page = self._open_page(proxy=proxy) if proxy else self._open_page()
+        local.opening_account_id = account_id
+        try:
+            page = self._open_page(proxy=proxy) if proxy else self._open_page()
+        finally:
+            local.opening_account_id = None
         self.page = page  # Cleanup must also own pages that never become ready.
         self._ensure_local().proxy_config = proxy
         self._apply_cookies(page, cookies, expires)
@@ -818,17 +1038,19 @@ class MuseEngine:
             body = ""
         self._close_page()
         if proxy and re.search(r"err_(?:proxy|tunnel)|proxy authentication|代理认证失败", body, re.I):
+            self.dispose_account_context(account_id)
             raise MuseProxyError("账号代理浏览器连接失败，请检查节点或认证；未回退直连")
         if "connecting..." in body:
             raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
         # Distinguish an expired session from a page that never became ready.
         if re.search(r"log in|sign in|create an account|登录|use another account", body):
+            self.dispose_account_context(account_id)
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie")
         raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
 
-    _PARK_FIELDS = ("page", "current_context_id", "current_acc_id", "proxy_relay",
-                    "proxy_config", "download_dir")
+    _PARK_FIELDS = ("page", "current_context_id", "current_acc_id", "current_target_id",
+                    "proxy_relay", "proxy_config", "download_dir")
 
     def park_current_page(self, account_id: str, owner: str,
                           thread_id: str | None = None) -> bool:
@@ -1027,6 +1249,7 @@ class MuseEngine:
                 time.sleep(0.2)
         finally:
             self._close_page()
+            self.dispose_account_context(account_id)
 
     @staticmethod
     def _parse_quota(txt: str) -> dict:
@@ -1184,21 +1407,10 @@ class MuseEngine:
     )
 
     def _send(self, prompt: str):
-        # 1. 确保 textarea 滚动到视口中央并获得真实焦点
-        try:
-            self.page.js("""(function(){
-                var ta = document.querySelector('textarea');
-                if (ta) {
-                    ta.scrollIntoView({block: 'center', inline: 'nearest'});
-                    ta.focus();
-                }
-            })()""")
-        except Exception:
-            pass
-        time.sleep(0.1)
-
+        # 1. 确保 textarea 滚动到视口中央并获取位置
         rect = self.page.js(
             "(function(){var t=document.querySelector('textarea');if(!t)return null;"
+            "t.scrollIntoView({block:'center',inline:'nearest'});t.focus();"
             "var r=t.getBoundingClientRect();"
             "return JSON.stringify({x:Math.round(r.left+r.width/2),"
             "y:Math.round(r.top+r.height/2)});})()")
@@ -1209,14 +1421,14 @@ class MuseEngine:
             self.page.send("Input.dispatchMouseEvent",
                            {"type": t, "x": c["x"], "y": c["y"],
                             "button": "left", "clickCount": 1})
-        time.sleep(0.1)
 
-        # 触发 React 18 原型 setter 以及 input/change 事件以同步发送按钮状态
-        # （对于 DeepSeek/Codex 等 100KB+ 超长上下文，直接走原型 setter 仅需 <1s，避免 Input.insertText 逐字注入卡死）
+        # 触发 React 18 原型 setter、重置 _valueTracker 并派发 input/change 事件以同步发送按钮状态
         _SETTER_JS = (
             "(function(t){var ta=document.querySelector('textarea');"
             "if(!ta) return 0;"
             "ta.focus();"
+            "var tr=ta._valueTracker;"
+            "if(tr&&typeof tr.setValue==='function')tr.setValue('');"
             "var s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
             "s.call(ta,t);"
             "ta.dispatchEvent(new Event('input',{bubbles:true}));"
@@ -1235,11 +1447,11 @@ class MuseEngine:
             if res == "clicked":
                 clicked = "clicked"
                 break
-            time.sleep(0.08)
+            time.sleep(0.03)
 
         if clicked != "clicked":
-            # 兜底：Ctrl+Enter 或普通 Enter
-            for combo in ({"modifiers": 1}, {}):
+            # 兜底：Ctrl+Enter（CDP modifiers=2）或普通 Enter
+            for combo in ({"modifiers": 2}, {}):
                 for t in ("keyDown", "char", "keyUp"):
                     params = {"type": t, "key": "Enter", "code": "Enter",
                               "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
@@ -1248,14 +1460,13 @@ class MuseEngine:
                         params["text"] = "\r"
                         params["unmodifiedText"] = "\r"
                     self.page.send("Input.dispatchKeyEvent", params)
-                time.sleep(1.0)
+                time.sleep(0.5)
                 try:
                     if self.page.js("!(document.querySelector('textarea')||{value:''}).value"):
                         clicked = "enter-sent"
                         break
                 except Exception:
                     pass
-        time.sleep(0.3)
         return clicked
 
     def _composer_unsent(self) -> str:
@@ -1598,7 +1809,20 @@ class MuseEngine:
             if(style.display==='none'||style.visibility==='hidden'||node.hidden)return '';
             var tag=node.tagName;
             if(tag==='SCRIPT'||tag==='STYLE'||tag==='BUTTON')return '';
-            if(tag==='PRE'||tag==='CODE')return node.innerText||'';
+            if(tag==='PRE'){
+                var raw=(node.innerText||'').trim();
+                if(!raw)return '';
+                var cls=(node.className||'')+' '+(node.parentElement?node.parentElement.className||'':'');
+                var codeEl=node.querySelector('code');
+                if(codeEl)cls+=' '+(codeEl.className||'');
+                var prev=node.previousElementSibling?(node.previousElementSibling.innerText||''):'';
+                var looksLikeCall=(raw[0]==='{'||raw[0]==='[')&&/"name"\s*:/.test(raw)&&/"(?:arguments|parameters|input)"\s*:/.test(raw);
+                if(/tool_call/i.test(cls)||/tool_call/i.test(prev)||looksLikeCall){
+                    return '\n```tool_call\n'+raw+'\n```\n';
+                }
+                return node.innerText||'';
+            }
+            if(tag==='CODE')return node.innerText||'';
             if(tag==='BR')return '\n';
             var text=Array.from(node.childNodes).map(read).join('');
             if(tag==='A'){
@@ -1749,11 +1973,47 @@ class MuseEngine:
             return "", current
         return current[common:], current
 
+    def _check_stale_reused(self, base_users: int) -> None:
+        """热页面复用等待过久无响应时，检查连接或消息是否已停滞。"""
+        if not self.page:
+            raise MuseStalePageError("复用热页面已断开")
+        try:
+            raw = self.page.js("""(function(){
+                """ + self._STATUS_TEXT_FN_JS + """
+                var stuck = !!__museStatus(['Still sending', 'Connecting...', '正在连接']);
+                var ta = document.querySelector('textarea');
+                var wsBad = false;
+                if (ta) {
+                    var key = Object.keys(ta).find(function(k){ return k.indexOf('__reactFiber$') === 0; });
+                    if (key) {
+                        for (var f = ta[key], i = 0; f && i < 500; i++, f = f.return) {
+                            var v = f.memoizedProps && f.memoizedProps.value;
+                            if (v && typeof v === 'object' && typeof v.sendRequest === 'function' && v.isReady === false) {
+                                wsBad = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                var bs = [].slice.call(document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]'));
+                var users = 0;
+                for (var j = 0; j < bs.length; j++) {
+                    if (/chat-user-bubble/.test(bs[j].className || '')) users++;
+                }
+                var stop = """ + muse_events.STOP_VISIBLE_JS + """;
+                return JSON.stringify({stuck: stuck, wsBad: wsBad, users: users, stop: stop});
+            })()""")
+            info = json.loads(raw) if raw else {}
+        except Exception as exc:  # noqa: BLE001
+            raise MuseStalePageError(f"复用热页面探活失败: {exc}") from exc
+        if info.get("stuck") or info.get("wsBad") or (not info.get("stop") and int(info.get("users") or 0) <= base_users):
+            raise MuseStalePageError("复用热页面连接停滞或未送达，触发冷重载")
+
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, expect_tools: bool = False,
                     on_final_text=None, on_timing=None, thread_id: str | None = None,
-                    on_thread=None):
+                    on_thread=None, is_reused: bool = False):
         """发一条消息，流式 yield 增量文本。
 
         工具请求的首字窗口为 90 秒；Stop 按钮仍在时静默不算完成，Stop 消失后
@@ -1770,12 +2030,16 @@ class MuseEngine:
         if not thread_id:
             self.reset_thread(for_chat=True)
         elif (self.page.js("location.pathname") or "").rstrip("/") != "/thread/" + thread_id:
+            if is_reused:
+                raise MuseStalePageError("复用热页面位置偏移，触发冷重载")
             raise MuseGenerationError("已绑定 Muse thread 的页面位置不符；拒绝新建会话")
         if on_timing:
             on_timing("thread_reset_ms", round((time.monotonic() - stage) * 1000))
         base_agent, _, _ = self._poll_chat()
         base_users = self._user_count()
         if thread_id and base_users == 0 and base_agent == 0:
+            if is_reused:
+                raise MuseStalePageError("复用热页面内容不可读，触发冷重载")
             raise MuseGenerationError("已绑定的 Muse thread 为空或不可读；拒绝发送以免创建替代会话")
         # 发送前清空事件队列：此前的事件（历史回放、上一轮）都不属于本次回复。
         assembler = muse_events.ReplyAssembler()
@@ -1783,13 +2047,18 @@ class MuseEngine:
         for record in (drained[1] if drained else []):
             assembler.note_existing(record)
         stage = time.monotonic()
-        sent_state = self._send(prompt)
-        if sent_state not in ("clicked", "enter-sent"):
-            raise MuseGenerationError(f"提示词未能提交到 muse.ai（{sent_state}）")
-        if on_timing:
-            on_timing("send_ms", round((time.monotonic() - stage) * 1000))
-        stage = time.monotonic()
-        self._confirm_sent(base_users, sent_state)
+        try:
+            sent_state = self._send(prompt)
+            if sent_state not in ("clicked", "enter-sent"):
+                raise MuseGenerationError(f"提示词未能提交到 muse.ai（{sent_state}）")
+            if on_timing:
+                on_timing("send_ms", round((time.monotonic() - stage) * 1000))
+            stage = time.monotonic()
+            self._confirm_sent(base_users, sent_state)
+        except MuseGenerationError as exc:
+            if is_reused:
+                raise MuseStalePageError(f"复用热页面发送失败: {exc}") from exc
+            raise
         if on_timing:
             on_timing("send_confirm_ms", round((time.monotonic() - stage) * 1000))
 
@@ -1798,10 +2067,11 @@ class MuseEngine:
         first_wait = 90.0 if expect_tools else 40.0
         first_token_deadline = min(deadline, t_sent + first_wait)
 
-        if drained is not None and drained[0] > 0:
+        if drained is not None:
             used = yield from self._stream_events(
                 assembler, t_sent, deadline, first_token_deadline, base_agent, stop_event,
-                expect_tools, on_final_text, on_timing, on_thread)
+                expect_tools, on_final_text, on_timing, on_thread,
+                base_users=base_users, is_reused=is_reused)
             if used:
                 return
             if on_timing:
@@ -1812,6 +2082,7 @@ class MuseEngine:
         stable_since = None
         stop_prev = False
         got_first = False
+        stale_checked = False
 
         def finish():
             text = last_snapshot
@@ -1838,12 +2109,18 @@ class MuseEngine:
             # 不可靠；气泡计数才是基线。
             if not cur or cnt <= base_agent:
                 if time.monotonic() - t_sent > 14.0:
+                    if is_reused and not stale_checked:
+                        stale_checked = True
+                        self._check_stale_reused(base_users)
                     try:
-                        tail = self.page.js("document.body.innerText.slice(-500)") or ""
+                        status = self.page.js(
+                            "(function(){" + self._STATUS_TEXT_FN_JS
+                            + "return __museStatus(['Still sending','Connecting...','正在连接']);})()") or ""
                     except Exception:
-                        tail = ""
-                    if "Still sending" in tail or "Connecting..." in tail:
-                        raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+                        status = ""
+                    if status:
+                        err = "云端 VM 连接超时 (Still sending)"
+                        raise (MuseStalePageError(err) if is_reused else MuseGenerationError(err))
                 stop_prev = has_stop
                 continue
 
@@ -1860,6 +2137,8 @@ class MuseEngine:
             stop_prev = has_stop
 
         if not got_first:
+            if is_reused:
+                raise MuseStalePageError("复用热页面等待助手首字响应超时")
             raise MuseGenerationError("等待助手首字响应超时")
 
         # 2. 持续捕获增量文本
@@ -1908,14 +2187,19 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             on_thread(None)
 
-    def _drain_events(self) -> tuple[int, list[dict]] | None:
+    def _drain_events_with_stop(self) -> tuple[int, list[dict], bool | None] | None:
         try:
-            return muse_events.parse_drain(self.page.js(muse_events.DRAIN_JS))
+            return muse_events.parse_drain_with_stop(self.page.js(muse_events.DRAIN_JS))
         except Exception:  # noqa: BLE001
             return None
 
+    def _drain_events(self) -> tuple[int, list[dict]] | None:
+        res = self._drain_events_with_stop()
+        return (res[0], res[1]) if res is not None else None
+
     def _stream_events(self, assembler, t_sent, deadline, first_token_deadline, base_agent,
-                       stop_event, expect_tools, on_final_text, on_timing, on_thread):
+                       stop_event, expect_tools, on_final_text, on_timing, on_thread,
+                       base_users: int = 0, is_reused: bool = False):
         """事件流主路径（CHATSRC）：输出 Markdown 增量。返回 False 表示应退回 DOM 读取。
 
         只有还没输出任何内容时才能退回 DOM；一旦输出过，就在回复结束后用 message_done 或
@@ -1925,6 +2209,7 @@ class MuseEngine:
         start_deadline = min(first_token_deadline, t_sent + 8.0)
         dom_seen_at = None
         first_sent = False
+        stale_checked = False
         quiet = 4.0 if expect_tools else 0.18
         stable_since = None
         while True:
@@ -1934,7 +2219,9 @@ class MuseEngine:
             if now >= deadline:
                 raise MuseGenerationError("等待助手回复超时")
             time.sleep(0.05)
-            drained = self._drain_events()
+            drained_full = self._drain_events_with_stop()
+            drained = (drained_full[0], drained_full[1]) if drained_full is not None else None
+            drained_stop = drained_full[2] if drained_full is not None else None
             if drained is None and not assembler.emitted:
                 return False  # 页面重载丢了订阅脚本，且还没输出：交给 DOM
             for record in (drained[1] if drained else []):
@@ -1942,12 +2229,18 @@ class MuseEngine:
             if assembler.error:
                 raise MuseGenerationError(f"Muse 生成失败：{assembler.error}")
             if not assembler.started:
-                if time.monotonic() >= start_deadline:
+                cur_now = time.monotonic()
+                if is_reused and not stale_checked and cur_now - t_sent >= 15.0:
+                    stale_checked = True
+                    self._check_stale_reused(base_users)
+                if drained is None or drained[0] == 0 or cur_now >= start_deadline:
                     cnt, cur, _ = self._poll_chat()
                     if cnt > base_agent and cur:
                         return False  # DOM 已有新回复但事件没来：订阅不可用
-                    if time.monotonic() >= first_token_deadline:
-                        raise MuseGenerationError("等待助手首字响应超时")
+                if cur_now >= first_token_deadline:
+                    if is_reused:
+                        raise MuseStalePageError("复用热页面等待助手首字响应超时")
+                    raise MuseGenerationError("等待助手首字响应超时")
                 continue
             delta = assembler.take()
             if delta:
@@ -1958,16 +2251,19 @@ class MuseEngine:
                 yield delta
             # 一轮回复可能由多条消息组成（先文字、再工具调用）。已知消息都完成不代表本轮结束：
             # 还要等 Stop 消失并静默一段时间，期间出现新的 message_start 就继续收（CHATSRC-B08）。
-            try:
-                stopping = bool(self.page.js(muse_events.STOP_VISIBLE_JS))
-            except Exception:  # noqa: BLE001
-                stopping = True
+            if isinstance(drained_stop, bool):
+                stopping = drained_stop
+            else:
+                try:
+                    stopping = bool(self.page.js(muse_events.STOP_VISIBLE_JS))
+                except Exception:  # noqa: BLE001
+                    stopping = True
             if stopping:
                 stable_since = None
                 continue
             stable_since = stable_since or time.monotonic()
             if assembler.all_done:
-                if time.monotonic() - stable_since >= max(quiet, 1.0):
+                if time.monotonic() - stable_since >= 0.08:
                     break
             elif time.monotonic() - stable_since >= max(quiet, 3.0):
                 # 事件中途断了：Stop 消失并静默一段时间后，按回复结束处理（CHATSRC-B03）。

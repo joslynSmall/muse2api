@@ -367,6 +367,41 @@ with tempfile.TemporaryDirectory() as home:
             assert list(gen) == []
         assert finals == []
 
+    def CHATSRC_regex_caret_brackets_preserved_and_transcript_done():
+        # ^[0-9]+ 等正则表达式不得被引用逻辑误删，也不应在流式阶段冻结输出。
+        regex_call = '```tool_call\n{"name": "Grep", "arguments": {"pattern": "^[0-9]+|^[^a-z]"}}\n```'
+        a = ReplyAssembler()
+        a.feed(ev("delta.message_start", "m1"))
+        a.feed(ev("delta.text_append", "m1", seq=0, text=regex_call[:66]))
+        part1 = a.take()
+        assert "^[0-9]+" in part1, part1
+        a.feed(ev("delta.text_append", "m1", seq=1, text=regex_call[66:]))
+        part2 = a.take()
+        a.feed(ev("delta.message_done", "m1", status="completed",
+                  transcript=[{"role": "assistant", "message_id": "m1", "content": regex_call}]))
+        part3 = a.take(final=True)
+        assert part1 + part2 + part3 == regex_call
+        assert a.final_text() == regex_call
+
+        # 初始 subs=0 在发送期间挂载后（subs 变为 1），仍能走事件流并快速结束。
+        class LateSubPage(FakePage):
+            def __init__(self, timeline):
+                super().__init__(timeline, subs=0)
+                self.drains = 0
+
+            def js(self, expr, *a, **k):
+                if expr == muse_events.DRAIN_JS:
+                    self.drains += 1
+                    self.subs = 0 if self.drains == 1 else 1
+                return super().js(expr, *a, **k)
+
+        page = LateSubPage([(0.2, ev("delta.message_start", "m1")),
+                            (0.3, ev("delta.text_append", "m1", seq=0, text=regex_call)),
+                            (0.4, ev("delta.message_done", "m1", status="completed"))])
+        chunks, finals, _, timing = run(page, lambda: (1, "", False), expect_tools=True)
+        assert "".join(chunks) == regex_call and finals == [regex_call]
+        assert timing.get("source_events") == 1 and Clock.now < 1.0, (timing, Clock.now)
+
     CHATSRC_B01_markdown_increments()
     CHATSRC_B03_done_fills_lost_tail()
     CHATSRC_B04_failed_status()
@@ -380,4 +415,5 @@ with tempfile.TemporaryDirectory() as home:
     CHATSRC_B08_waits_for_followup_message()
     CHATSRC_B09_stop_visible_conditions()
     CHATSRC_B10_dom_fallback_reuses_stop_visibility()
+    CHATSRC_regex_caret_brackets_preserved_and_transcript_done()
     print("PASS: CHATSRC-B01..B10 event stream markdown, fallback, fill, failure, citations, cancel, stop visibility")

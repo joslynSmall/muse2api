@@ -55,8 +55,8 @@ import thread_prune
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, RefImageSafetyError, reference_kind)
-from engine import MuseProxyError
+                    MuseModelRefusalError, MuseProxyError, MuseStalePageError,
+                    RefImageSafetyError, reference_kind)
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 
@@ -407,6 +407,22 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
     return store.get_account(acc_id)
 
 
+_PRUNE_LOCK = threading.Lock()
+_NEW_THREADS_SINCE_PRUNE: dict[str, int] = {}
+_PRUNE_BATCH = 5
+
+
+def _should_prune_account(account_id: str | None) -> bool:
+    key = account_id or "_"
+    with _PRUNE_LOCK:
+        count = _NEW_THREADS_SINCE_PRUNE.get(key, 0) + 1
+        if count >= _PRUNE_BATCH:
+            _NEW_THREADS_SINCE_PRUNE[key] = 0
+            return True
+        _NEW_THREADS_SINCE_PRUNE[key] = count
+        return False
+
+
 def _prune_side_chats(page, account_id: str | None) -> None:
     """新建 thread 回复完成后清理旁聊（CHATPRUN-B05）；任何失败只记日志（B03/B04）。"""
     if page is None:
@@ -520,32 +536,45 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     engine.start()
                     timings["browser_start_ms"] = round((time.monotonic() - stage) * 1000)
                     first_engine_yield = None
+                    reused_page = False
                     if reuse_pages and cur_id:
                         if thread_id:
-                            timings["page_reused"] = int(engine.adopt_parked_page(
+                            reused_page = bool(engine.adopt_parked_page(
                                 cur_id, thread_id, session_key, CFG.chat_page_idle))
+                            timings["page_reused"] = int(reused_page)
                         else:
                             engine.discard_parked(cur_id)  # 新开 / 重绑 thread：旧页面无用
-                    timings["phase"] = "engine_page_and_send"
-                    for chunk in engine.chat_stream(
-                        cur_cookies, prompt, cur_exp, max(1, int(remaining())),
-                        account_id=cur_id, stop_event=stop_event,
-                        expect_tools=expect_tools,
-                        on_final_text=on_final_text,
-                        on_timing=lambda name, ms: timings.__setitem__(name, ms),
-                        thread_id=thread_id, on_thread=on_thread
-                    ):
-                        if first_engine_yield is None:
-                            first_engine_yield = time.monotonic()
-                            timings["phase"] = "generation"
-                            timings["engine_first_delta_ms"] = round(
-                                (first_engine_yield - request_started) * 1000)
-                        yielded = True
-                        if not publish("data", chunk):
-                            return
+                    for hot_attempt in ((True, False) if reused_page else (False,)):
+                        try:
+                            timings["phase"] = "engine_page_and_send"
+                            for chunk in engine.chat_stream(
+                                cur_cookies, prompt, cur_exp, max(1, int(remaining())),
+                                account_id=cur_id, stop_event=stop_event,
+                                expect_tools=expect_tools,
+                                on_final_text=on_final_text,
+                                on_timing=lambda name, ms: timings.__setitem__(name, ms),
+                                thread_id=thread_id, on_thread=on_thread,
+                                **({"is_reused": True} if hot_attempt else {})
+                            ):
+                                if first_engine_yield is None:
+                                    first_engine_yield = time.monotonic()
+                                    timings["phase"] = "generation"
+                                    timings["engine_first_delta_ms"] = round(
+                                        (first_engine_yield - request_started) * 1000)
+                                yielded = True
+                                if not publish("data", chunk):
+                                    return
+                            break
+                        except MuseStalePageError as exc:
+                            if hot_attempt and not yielded and not stop_event.is_set() and remaining() > 15:
+                                log.warning("复用热页面失效，销毁并冷重载 thread=%s: %s", thread_id, exc)
+                                timings["hot_fallback"] = 1
+                                engine.close_current_page()
+                                continue
+                            raise
                     if cur_id and not stop_event.is_set():
                         store.mark(cur_id, True, "")
-                    if not thread_id and not stop_event.is_set():
+                    if not thread_id and not stop_event.is_set() and _should_prune_account(cur_id):
                         timings["phase"] = "thread_prune"
                         _prune_side_chats(engine.page, cur_id)
                     succeeded = not stop_event.is_set()
@@ -687,6 +716,9 @@ class ChatRequest(BaseModel):
     stream_options: object | None = None
     reasoning_effort: str | None = None
     reasoning: object | None = None
+    metadata: dict | None = None
+    prompt_cache_key: str | None = None
+    user: str | None = None
 
 
 class ResponsesRequest(BaseModel):
@@ -701,6 +733,10 @@ class ResponsesRequest(BaseModel):
     tool_choice: object | None = None
     reasoning: object | None = None
     store: bool | None = None
+    metadata: dict | None = None
+    prompt_cache_key: str | None = None
+    user: str | None = None
+    conversation: object | None = None
 
 
 class MessagesRequest(BaseModel):
@@ -716,7 +752,6 @@ class MessagesRequest(BaseModel):
     stream: bool = False
     max_tokens: int | None = None
     timeout: int | None = None
-    metadata: dict | None = None
 
 
 class AccountProxy(BaseModel):
@@ -1077,10 +1112,12 @@ class ChatTurn:
     无会话 Header 时退化为原来的无状态行为：完整历史、随机账号、/thread/new。
     """
 
-    def __init__(self, request: Request | None, messages: list[ChatMessage], timeout: int):
+    def __init__(self, request: Request | None, messages: list[ChatMessage], timeout: int,
+                 *, metadata=None, prompt_cache_key: str | None = None, user: str | None = None):
         headers = request.headers if request is not None else {}
-        key = CHAT_SESSIONS.key(headers.get("x-claude-code-session-id"),
-                                headers.get("x-claude-code-agent-id"))
+        session_id, agent_id = CHAT_SESSIONS.extract_identity(
+            headers, metadata=metadata, prompt_cache_key=prompt_cache_key, user=user)
+        key = CHAT_SESSIONS.key(session_id, agent_id)
         if key and _is_side_request(messages):
             # 输入建议等后台请求共用会话 ID，但不属于主对话；写进绑定 thread 会污染它，
             # 还会让下一轮主对话的历史前缀对不上而被误判为压缩。
@@ -1896,14 +1933,11 @@ def _want_usage(stream_options) -> bool:
     return False
 
 
-def _pace_text(text: str, chunk_size: int = 2, delay: float = 0.012):
-    """把大块文本平滑切分为仿原生 LLM 打字机的微流式 Token。
-    若传入文本本身微小（<= 3 字），直接秒级放行，零延迟；
-    若传入文本是大块（如 DOM 批量刷新），按每 chunk_size 字间隔 delay 平滑输出。
-    """
+def _pace_text(text: str, chunk_size: int = 8, delay: float = 0.002):
+    """把大块文本平滑切分为流式片段；微片段直接透传零延迟。"""
     if not text:
         return
-    if len(text) <= 3 or delay <= 0:
+    if len(text) <= 16 or delay <= 0:
         yield text
         return
     for i in range(0, len(text), chunk_size):
@@ -1938,8 +1972,9 @@ async def chat_completions(req: ChatRequest, request: Request = None, _=Depends(
         if not prompt:
             raise HTTPException(400, "messages 为空")
         req.messages = [ChatMessage(role="user", content=prompt)]
-    # 带 X-Claude-Code-Session-Id 时按 CHATSESS 绑定到同一个 Muse thread。
-    turn = ChatTurn(request, req.messages, timeout)
+    # 带会话 Header 或兼容会话字段时按 CHATSESS 绑定到同一个 Muse thread。
+    turn = ChatTurn(request, req.messages, timeout,
+                    metadata=req.metadata, prompt_cache_key=req.prompt_cache_key, user=req.user)
     prompt = turn.prompt(build_chat_prompt)
     if not prompt:
         turn.close()
@@ -2177,33 +2212,38 @@ def _emit_response_calls(rid: str, start: int, calls: list[dict]):
 
 
 @app.post("/v1/responses")
-async def responses_api(req: ResponsesRequest, _=Depends(auth)):
+async def responses_api(req: ResponsesRequest, request: Request = None, _=Depends(auth)):
     """OpenAI Responses API —— 新版 Codex 默认走这个端点。
 
     文本照常以 output_text 流出。带 tools 时先收完整段回复再解析：
     模型按协议输出的 JSON 变成 function_call，而不是混在正文里。
     """
     response_messages = _responses_messages(req)
-    prompt = build_chat_prompt(response_messages)
-    has_tool_results = any((m.role or "").lower() == "tool" for m in response_messages)
+    if not response_messages:
+        raise HTTPException(400, "input 为空")
+    timeout = int(req.timeout or CFG.chat_timeout)
+    turn = ChatTurn(request, response_messages, timeout,
+                    metadata=req.metadata, prompt_cache_key=req.prompt_cache_key, user=req.user)
+    prompt = turn.prompt(build_chat_prompt)
     if not prompt:
+        turn.close()
         raise HTTPException(400, "input 为空")
     has_tools = bool(CFG.tool_protocol and build_tools_prompt(req.tools, req.tool_choice))
-    prompt = _with_tools(prompt, req.tools, req.tool_choice)
+    prompt = turn.with_tools(prompt, req.tools, req.tool_choice)
     model = resolve_model(req.model, default="muse-spark")
 
-    timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    full_prompt = build_chat_prompt(response_messages)
+    tools_note = build_tools_prompt(req.tools, req.tool_choice) if CFG.tool_protocol else ""
+    input_tokens = estimate_tokens(full_prompt + ("\n\n" + tools_note if tools_note else ""))
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]
     created = int(time.time())
+    acc = turn.account
     acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
+    extra = turn.stream_kwargs
 
     def envelope(status: str, text: str = "", calls: list[dict] | None = None) -> dict:
-        input_tokens = estimate_tokens(prompt)
         output_tokens = _output_tokens(text, calls) if status == "completed" else 0
         return {"id": rid, "object": "response", "created_at": created,
                 "status": status, "model": model,
@@ -2223,7 +2263,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     return
                 text, calls = _generate_tool_reply(
                     cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
-                    has_tool_results=has_tool_results)
+                    retry=turn.retry_factory(cookies, expires, timeout, acc_id),
+                    has_tool_results=turn.has_tool_results, **extra)
+                turn.commit()
                 if text:
                     yield from _emit_response_text(rid, mid, 0, text, paced=not calls)
                 if calls:
@@ -2237,6 +2279,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
                     "response": envelope("failed")})
+            finally:
+                turn.close()
 
         def _emit_response_text_live():
             yield _sse_event("response.output_item.added", {
@@ -2249,12 +2293,13 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                 "item_id": mid, "output_index": 0, "content_index": 0,
                 "part": {"type": "output_text", "text": "", "annotations": []}})
             full = ""
-            for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+            for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, **extra):
                 full += chunk
                 yield _sse_event("response.output_text.delta", {
                     "type": "response.output_text.delta", "response_id": rid,
                     "item_id": mid, "output_index": 0, "content_index": 0,
                     "delta": chunk})
+            turn.commit()
             yield _sse_event("response.output_text.done", {
                 "type": "response.output_text.done", "response_id": rid,
                 "item_id": mid, "output_index": 0, "content_index": 0, "text": full})
@@ -2271,23 +2316,27 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
             store.mark(acc_id, True, "")
 
         return StreamingResponse(
-            stream_with_heartbeat(sync_stream_live, ": keepalive\n\n"),
+            stream_with_heartbeat(sync_stream_live, ": keepalive\n\n", on_done=turn.close),
             media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run_response():
         if has_tools:
             return _generate_tool_reply(
                 cookies, prompt, expires, timeout, acc_id, req.tools, req.tool_choice,
-                has_tool_results=has_tool_results)
+                retry=turn.retry_factory(cookies, expires, timeout, acc_id),
+                has_tool_results=turn.has_tool_results, **extra)
         return "".join(safe_chat_stream(
-            cookies, prompt, expires, timeout, account_id=acc_id)), None
+            cookies, prompt, expires, timeout, account_id=acc_id, **extra)), None
 
     try:
-        text, calls = await asyncio.to_thread(run_response)
+        text, calls = await run_cancellable(run_response, request)
+        turn.commit()
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc))
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc))
+    finally:
+        turn.close()
     store.mark(acc_id, True, "")
     return envelope("completed", text, calls)
 
@@ -2386,9 +2435,9 @@ def _message_body(mid: str, model: str, text: str, calls: list[dict] | None,
 
 
 def _message_text_deltas(index: int, text: str):
-    """网页批量刷新时拆成小片；单个 DOM 批次的展示延迟最多两秒。"""
+    """网页批量刷新时拆成小片；仅对大块文本施加极轻节流（最多 0.4 秒）。"""
     pieces = max(1, (len(text) + 3) // 4)
-    delay = min(0.012, 2.0 / max(1, pieces - 1))
+    delay = min(0.002, 0.4 / max(1, pieces - 1)) if pieces > 1 else 0.0
     for offset in range(0, len(text), 4):
         yield _sse_event("content_block_delta", {
             "type": "content_block_delta", "index": index,
@@ -2439,7 +2488,7 @@ async def messages_api(req: MessagesRequest, request: Request = None, _=Depends(
     has_tools = bool(CFG.tool_protocol and build_tools_prompt(req.tools, req.tool_choice))
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    turn = ChatTurn(request, incoming, timeout)
+    turn = ChatTurn(request, incoming, timeout, metadata=req.metadata)
     prompt = turn.prompt(_messages_prompt)
     if not prompt:
         turn.close()
@@ -3200,12 +3249,35 @@ async def run_keepalive_all(force: bool = False) -> dict:
 
 
 def _warmup_browser_sync():
-    """只预热共享 Chromium 进程；账号页面属于请求线程，不跨线程保留。"""
+    """预热共享 Chromium 进程，并为首个空闲账号预建持久 BrowserContext 与页面缓存。"""
     if not GEN_LOCK.acquire(blocking=False):
         return
     try:
         engine.start()
-        log.info("【浏览器预热】Chromium/CDP 已就绪")
+        candidate = store.pick_account(rotate=True, record_use=False)
+        warmed = False
+        if candidate and candidate.get("cookies"):
+            acc = None
+            try:
+                acc = ACCOUNT_POOL.acquire(
+                    account_id=candidate["id"], timeout=2, record_use=False)
+                _bind_account_proxy(acc)
+                engine.ensure_page(
+                    acc["cookies"], acc.get("cookies_exp"), account_id=acc["id"])
+                warmed = True
+            except Exception as wexc:  # noqa: BLE001
+                log.warning("【浏览器预热】账号上下文预热跳过（不影响服务就绪）: %s", wexc)
+            finally:
+                try:
+                    engine.close_current_page()
+                finally:
+                    _clear_account_proxy()
+                    if acc is not None:
+                        ACCOUNT_POOL.release(acc["id"])
+        if warmed:
+            log.info("【浏览器预热】Chromium 与账号上下文缓存已就绪")
+        else:
+            log.info("【浏览器预热】Chromium/CDP 已就绪")
     except Exception as exc:  # noqa: BLE001
         log.warning("【浏览器预热】Chromium 预热失败: %s", exc)
     finally:

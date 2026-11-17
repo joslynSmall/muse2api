@@ -15,18 +15,23 @@ spec = importlib.util.spec_from_file_location("muse_engine_candidate", ROOT / "e
 engine_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(engine_module)
 
-tree = ast.parse((ROOT / "engine.py").read_text(encoding="utf-8"))
-method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_wait_ws_ready")
-expression = next(n.args[0].value for n in ast.walk(method)
-                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "js")
+expression = engine_module.MuseEngine._WS_READY_JS
 
-for name, connecting, hydrated, disabled, expected in (
-        ("empty_connected", False, True, False, "ready"),
-        ("connecting", True, True, False, "connecting"),
-        ("hydrating", False, False, False, "hydrating"),
-        ("disabled_input", False, True, True, "input-disabled")):
-    script = """const c=%s;const ta={disabled:c.disabled};const document={readyState:'complete',body:{innerText:c.connecting?'Connecting...':''},querySelector:s=>s==='textarea'?ta:s==='[data-hatch-shell-hydration-state]'?{getAttribute:()=>c.hydrated?'hydrated':'server'}:null};console.log(%s);""" % (
-        json.dumps(dict(connecting=connecting, hydrated=hydrated, disabled=disabled)), expression)
+for name, connecting, in_bubble, hydrated, disabled, expected in (
+        ("empty_connected", False, False, True, False, "ready"),
+        ("connecting", True, False, True, False, "connecting"),
+        # Chat history (e.g. a pasted git diff) mentioning Connecting... is not a banner.
+        ("connecting_in_bubble", True, True, True, False, "ready"),
+        ("hydrating", False, False, False, False, "hydrating"),
+        ("disabled_input", False, False, True, True, "input-disabled")):
+    script = """const c=%s;const NodeFilter={SHOW_TEXT:4};const ta={disabled:c.disabled};
+const node={nodeValue:'Connecting...',parentElement:{closest:()=>c.in_bubble?{}:null,getClientRects:()=>[1]}};
+const document={readyState:'complete',body:{textContent:c.connecting?'Connecting...':''},
+createTreeWalker:()=>{let done=false;return {nextNode:()=>{if(done||!c.connecting)return null;done=true;return node;}};},
+querySelector:s=>s==='textarea'?ta:s==='[data-hatch-shell-hydration-state]'?{getAttribute:()=>c.hydrated?'hydrated':'server'}:null};
+console.log(%s);""" % (
+        json.dumps(dict(connecting=connecting, in_bubble=in_bubble, hydrated=hydrated, disabled=disabled)),
+        expression)
     result = subprocess.check_output(["node", "-e", script], text=True).strip()
     assert result == expected, (name, result, expected)
 

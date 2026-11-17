@@ -148,6 +148,27 @@ with tempfile.TemporaryDirectory() as home:
         assert run("other", None, key=None) == "ok"
         assert acc["id"] not in engine._parked, "无状态请求不停放，且会关闭他人热页面"
 
+        # 复用热页面遇到 MuseStalePageError 时，在同请求内自动销毁并冷重载一次。
+        seen_reused = []
+
+        def stale_then_ok(cookies, prompt, *a, is_reused=False, **kw):
+            seen_reused.append(is_reused)
+            if engine.page is None:
+                pages.append(open_page("/thread/" + THREAD_A, account=acc["id"]))
+            if is_reused:
+                raise app.MuseStalePageError("stale ws")
+            yield "recovered"
+
+        with patch.object(engine, "start", lambda: None), \
+             patch.object(engine, "chat_stream", side_effect=stale_then_ok):
+            assert "".join(app.safe_chat_stream(
+                acc["cookies"], "warm", None, 30, acc["id"], thread_id=THREAD_A,
+                pin_account=True, session_key="sess-stale")) == "recovered"
+            assert "".join(app.safe_chat_stream(
+                acc["cookies"], "reuse-and-recover", None, 30, acc["id"], thread_id=THREAD_A,
+                pin_account=True, session_key="sess-stale")) == "recovered"
+        assert seen_reused == [False, True, False], seen_reused
+
     CHATSESS_B14_park_and_adopt_same_session()
     CHATSESS_B14_mismatch_falls_back_to_cold_start()
     CHATSESS_B15_park_rejects_wrong_page()

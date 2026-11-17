@@ -57,8 +57,14 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE"
 fi
 
-nohup "$PYTHON" -m uvicorn app:app --host "$HOST" --port "$PORT" \
-    >"$LOG_FILE" 2>&1 < /dev/null &
+: >"$LOG_FILE"
+if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "$PYTHON" -m uvicorn app:app --host "$HOST" --port "$PORT" \
+        >>"$LOG_FILE" 2>&1 < /dev/null &
+else
+    nohup "$PYTHON" -m uvicorn app:app --host "$HOST" --port "$PORT" \
+        >>"$LOG_FILE" 2>&1 < /dev/null &
+fi
 PID=$!
 printf '%s\n' "$PID" > "$PID_FILE"
 

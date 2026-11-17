@@ -459,5 +459,86 @@ def test_CHATMSG_B15_truncated_call_is_distinct_from_malformed():
         assert "一千个字符" in rendered and "十行" in rendered, rendered
 
 
+def test_multi_calls_and_fence_variants():
+    # 单代码块内多个连续 JSON 调用全部保留，不能吞掉第二个。
+    multi_fence = (
+        '```tool_call\n'
+        '{"name": "Read", "arguments": {"file_path": "/a"}}\n'
+        '{"name": "Bash", "arguments": {"command": "ls"}}\n'
+        '```')
+    calls, rest = tp.parse_tool_calls(multi_fence, TOOLS)
+    assert names(calls) == ["Read", "Bash"] and rest == "", (calls, rest)
+
+    multi_tag = (
+        '<tool_call>\n'
+        '{"name": "Read", "arguments": {"file_path": "/a"}}\n'
+        '{"name": "AnthropicTool", "arguments": {"path": "/b"}}\n'
+        '</tool_call>')
+    calls, rest = tp.parse_tool_calls(multi_tag, TOOLS)
+    assert names(calls) == ["Read", "AnthropicTool"] and rest == "", (calls, rest)
+
+    # tool_call 标记后接 ```json 代码块及 ** 修饰符
+    inline_json_fence = (
+        '我先读取文件。\n\n**tool_call**:\n```json\n'
+        '{"name": "Read", "arguments": {"file_path": "/etc/hosts"}}\n```')
+    calls, rest = tp.parse_tool_calls(inline_json_fence, TOOLS)
+    assert names(calls) == ["Read"]
+    assert arguments(calls[0]) == {"file_path": "/etc/hosts"}
+    assert rest == "我先读取文件。", repr(rest)
+
+    # 未知工具放在 tool_call + ```json 中也能被识别
+    assert tp.unknown_tool_names('tool_call\n```json\n{"name": "browser.browse", "arguments": {}}\n```', TOOLS) == [
+        "browser.browse"]
+
+
+def test_stream_splitter_holds_whole_text_json():
+    splitter = tp.ToolStreamSplitter()
+    assert splitter.feed('  {"name": "Bash", ') == ""
+    assert splitter.feed('"arguments": {"command": "pwd"}}') == ""
+    rest, calls = splitter.finish(TOOLS)
+    assert rest == "" and names(calls) == ["Bash"]
+
+    # 普通非工具 JSON 会在 finish 时完整吐出
+    plain = tp.ToolStreamSplitter()
+    assert plain.feed('{"status": "ok"}') == ""
+    rest, calls = plain.finish(TOOLS)
+    assert calls is None and rest == '{"status": "ok"}'
+
+
+def test_schema_union_types_coercion_and_truncation():
+    rich_tools = [{
+        "name": "Search",
+        "description": "D" * 450,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": ["string", "null"], "description": "Q" * 300},
+                "limit": {"type": "integer"},
+                "strict": {"type": "boolean"},
+                "offset": {"type": "integer"},
+            },
+            "required": ["query"],
+            "additionalProperties": True,
+        },
+    }]
+    rendered = tp.build_tools_prompt(rich_tools)
+    assert "D" * 301 not in rendered and "Q" * 201 not in rendered
+
+    # 可选字段传 null 自动剔除；字符串数字/布尔自动转型；additionalProperties: True 放行扩展参数
+    raw = '```tool_call\n{"name": "Search", "arguments": {"query": "abc", "limit": "25", "strict": "true", "offset": null, "tag": "v1"}}\n```'
+    calls, _ = tp.parse_tool_calls(raw, rich_tools)
+    assert calls and tp.tool_call_problems(raw, calls, rich_tools) == []
+    assert arguments(calls[0]) == {"query": "abc", "limit": 25, "strict": True, "tag": "v1"}
+
+    # 正常解释中的"运行后"或条件假设不再误报为编造执行
+    for safe_prose in (
+        "命令运行后，服务会重新读取配置文件。",
+        "如果脚本运行成功，目录中会生成输出文件。",
+        "当执行结果返回时，你可以检查 `app.log` 文件。",
+    ):
+        assert not tp.claims_execution(safe_prose), safe_prose
+        assert tp.tool_call_problems(safe_prose, None, TOOLS) == []
+
+
 if __name__ == "__main__":
     main()

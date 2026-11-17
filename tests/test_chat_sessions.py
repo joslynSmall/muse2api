@@ -163,7 +163,32 @@ def CHATSESS_B12_stale_owner_cannot_commit():
     print("PASS: CHATSESS-B12 stale owner cannot commit")
 
 
+def CHATSESS_extract_identity_and_long_thread_rebind():
+    with tempfile.TemporaryDirectory() as directory:
+        store = ChatSessionStore(str(Path(directory) / "s.json"))
+        assert store.extract_identity({}) == (None, None)
+        assert store.extract_identity({"x-session-id": "s-1"}) == ("s-1", None)
+        assert store.extract_identity({}, metadata={"user_id": '{"session_id":"meta-s"}'}) == ("meta-s", None)
+        long_uid = "user_" + ("a" * 120) + "_session_123"
+        sid, _ = store.extract_identity({}, metadata={"user_id": long_uid})
+        assert sid and len(sid) <= 128 and store.key(sid) is not None
+        assert store.extract_identity({}, prompt_cache_key="codex-cache-1")[0] == "codex-cache-1"
+
+        key = store.key("long-thread")
+        hist = [msg("user", f"q{i}") for i in range(60)]
+        p1 = store.plan(key, hist)
+        assert p1.mode == "new"
+        store.commit(p1, THREAD_A, "acc-a")
+        # 原样重发第 60 轮仍继续复用原 thread
+        assert store.plan(key, hist).mode == "continue"
+        # 超过上限后的下一轮自动同账号重绑新 thread
+        p_next = store.plan(key, hist + [msg("user", "q60")])
+        assert p_next.mode == "rebind" and p_next.account_id == "acc-a" and p_next.thread_id is None
+    print("PASS: CHATSESS extract_identity and long-thread auto-rebind")
+
+
 if __name__ == "__main__":
     run()
     CHATSESS_B12_stale_owner_cannot_commit()
+    CHATSESS_extract_identity_and_long_thread_rebind()
 
