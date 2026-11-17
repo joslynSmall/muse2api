@@ -35,6 +35,20 @@ console.log(%s);""" % (
     result = subprocess.check_output(["node", "-e", script], text=True).strip()
     assert result == expected, (name, result, expected)
 
+# Ensure _VISIBLE_TEXT_FN_JS excludes chat-bubble/code text while preserving page chrome text.
+vis_script = """
+const NodeFilter={SHOW_TEXT:4};
+const nodes=[
+  {nodeValue:'Sign in to continue',inSkip:true},
+  {nodeValue:'New chat',inSkip:false}
+].map(item=>({nodeValue:item.nodeValue,parentElement:{closest:sel=>item.inSkip&&sel!=='script,style,noscript'?{}:null,getClientRects:()=>[1]}}));
+const document={body:{},createTreeWalker:()=>{let i=0;return {nextNode:()=>i<nodes.length?nodes[i++]:null};}};
+""" + engine_module.MuseEngine._VISIBLE_TEXT_FN_JS + """
+console.log(__museVisibleText(%s, 1200, false));
+""" % json.dumps(engine_module.MuseEngine._CHAT_SKIP_ALL)
+vis_out = subprocess.check_output(["node", "-e", vis_script], text=True).strip()
+assert vis_out == "New chat", vis_out
+
 with tempfile.TemporaryDirectory() as profile:
     engine = engine_module.MuseEngine(SimpleNamespace(profile_dir=profile, login_wait=2))
     clock = [0.0]

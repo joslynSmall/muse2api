@@ -873,7 +873,7 @@ class MuseEngine:
         var raw = body.textContent || '';
         var hit = words.filter(function(w){ return raw.indexOf(w) !== -1; });
         if (!hit.length) return '';
-        var skip = 'div[class*="hatch-chat-groupable-bubble"],pre,code,textarea,[contenteditable="true"]';
+        var skip = 'div[class*="hatch-chat-groupable-bubble"],.sr-only,pre,code,textarea,[contenteditable="true"]';
         var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
         var n;
         while ((n = walker.nextNode())) {
@@ -881,13 +881,48 @@ class MuseEngine:
             for (var i = 0; i < hit.length; i++) {
                 if (v.indexOf(hit[i]) === -1) continue;
                 var el = n.parentElement;
-                if (!el || el.closest(skip)) continue;
+                if (!el || el.closest(skip) || el.closest('script,style,noscript')) continue;
                 if (!el.getClientRects().length) continue;
                 return hit[i];
             }
         }
         return '';
     }"""
+
+    # 页面 chrome 的可见文字（排除 skip 选择器命中的节点），用于判断登录页、额度横幅等。
+    # 聊天内容（用户贴进来的日志、diff、源码，及 Muse 附带的 .sr-only 无障碍副本）不应影响账号或会话状态判定。
+    _CHAT_SKIP_ALL = 'div[class*="hatch-chat-groupable-bubble"],.sr-only,pre,code,textarea,[contenteditable="true"]'
+    _CHAT_SKIP_USER = 'div[class*="chat-user-bubble"],.sr-only,pre,code,textarea,[contenteditable="true"]'
+    _VISIBLE_TEXT_FN_JS = r"""function __museVisibleText(skip, limit, fromEnd){
+        var body = document.body;
+        if (!body) return '';
+        if (typeof document.createTreeWalker !== 'function') {
+            var raw = body.innerText || '';
+            return fromEnd ? raw.slice(-limit) : raw.slice(0, limit);
+        }
+        var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+        var parts = [], total = 0, n;
+        while ((n = walker.nextNode())) {
+            var v = n.nodeValue || '';
+            if (!v.trim()) continue;
+            var el = n.parentElement;
+            if (!el || el.closest(skip) || el.closest('script,style,noscript')) continue;
+            if (!el.getClientRects().length) continue;
+            parts.push(v);
+            total += v.length + 1;
+            if (!fromEnd && total >= limit) break;
+        }
+        var s = parts.join('\n');
+        return fromEnd ? s.slice(-limit) : s.slice(0, limit);
+    }"""
+
+    def _visible_text(self, skip: str, limit: int, from_end: bool = False) -> str:
+        try:
+            return self.page.js(
+                "(function(){" + self._VISIBLE_TEXT_FN_JS + "return __museVisibleText(%s,%d,%s);})()"
+                % (json.dumps(skip), int(limit), "true" if from_end else "false")) or ""
+        except Exception:  # noqa: BLE001
+            return ""
 
     _WS_READY_JS = """(function(){
         """ + _STATUS_TEXT_FN_JS + """
@@ -1032,15 +1067,21 @@ class MuseEngine:
                     raise MuseGenerationError("已绑定 Muse thread 未恢复既有对话内容；已停止以避免创建新会话")
             self.current_acc_id = account_id
             return page
+        # 只看页面 chrome：已绑定 thread 的聊天记录里可能出现 "log in" / "Connecting..." 等字样，
+        # 误判成登出会销毁账号上下文并把账号标为失效。
+        self.page = page
+        body = self._visible_text(self._CHAT_SKIP_ALL, 1200).lower()
+        status = ""
         try:
-            body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
+            status = page.js("(function(){" + self._STATUS_TEXT_FN_JS
+                             + "return __museStatus(['Connecting...','正在连接']);})()") or ""
         except Exception:
-            body = ""
+            pass
         self._close_page()
         if proxy and re.search(r"err_(?:proxy|tunnel)|proxy authentication|代理认证失败", body, re.I):
             self.dispose_account_context(account_id)
             raise MuseProxyError("账号代理浏览器连接失败，请检查节点或认证；未回退直连")
-        if "connecting..." in body:
+        if status in ("Connecting...", "正在连接"):
             raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
         # Distinguish an expired session from a page that never became ready.
         if re.search(r"log in|sign in|create an account|登录|use another account", body):
@@ -1635,7 +1676,23 @@ class MuseEngine:
                     var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
-                    var tail = document.body ? (document.body.innerText||'').slice(-1200) : '';
+                    var tail = '';
+                    if (document.body) {
+                        if (typeof document.createTreeWalker === 'function') {
+                            var skip = 'div[class*="chat-user-bubble"],.sr-only,pre,code,textarea,[contenteditable="true"]';
+                            var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT), ps = [], n;
+                            while ((n = w.nextNode())) {
+                                var v = n.nodeValue || '';
+                                if (!v.trim()) continue;
+                                var el = n.parentElement;
+                                if (!el || el.closest(skip) || el.closest('script,style,noscript') || !el.getClientRects().length) continue;
+                                ps.push(v);
+                            }
+                            tail = ps.join('\n').slice(-1200);
+                        } else {
+                            tail = (document.body.innerText||'').slice(-1200);
+                        }
+                    }
                     return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
                         path: location.pathname || '', href: location.href || ''});
                 })()""")

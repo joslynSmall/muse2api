@@ -354,9 +354,9 @@
 
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px">
-        <div style="display:flex;align-items:center;gap:10px">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0;max-width:100%">
           <h3 style="margin:0">账号列表 <span class="tag" id="poolCount">0</span></h3>
-          <span class="badge ok" id="keepaliveBadge" style="font-size:11px">● 自动保活轮转中 (30m)</span>
+          <span class="badge ok" id="keepaliveBadge" style="font-size:11px;white-space:normal;max-width:100%">● 自动保活轮转中 (30m)</span>
         </div>
         <div style="display:flex;gap:8px">
           <button class="secondary" id="btnKeepaliveAll" onclick="keepaliveAll()" style="font-size:12px;padding:6px 14px">⚡ 一键保活所有账号</button>
